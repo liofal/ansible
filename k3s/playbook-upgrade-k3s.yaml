@@ -1,0 +1,23 @@
+- name: Upgrade k3s cluster
+  hosts: k3s_cluster
+  become: yes
+  serial: 1 # Upgrade nodes one at a time
+  tasks:
+    - name: Drain the node before upgrading
+      command: kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-local-data
+      delegate_to: k3sc1.liofal.net
+      run_once: true
+
+    - name: Download k3s upgrade script
+      get_url:
+        url: https://github.com/k3s-io/k3s-upgrade/releases/download/v0.0.1/k3s-upgrade.sh
+        dest: /usr/local/bin/k3s-upgrade.sh
+        mode: '0755'
+
+    - name: Execute k3s upgrade script
+      command: /usr/local/bin/k3s-upgrade.sh
+
+    - name: Uncordon the node
+      command: kubectl uncordon {{ inventory_hostname }}
+      delegate_to: k3sc1.liofal.net
+      run_once: true
