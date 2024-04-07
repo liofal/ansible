@@ -1,0 +1,19 @@
+inventory/hosts.ini
+.devcontainer/.ssh/keys
+.devcontainer/.ssh/config
+.devcontainer/.ssh/known_hosts
+.vscode/settings.json
+
+# IDE-specific files and directories (for VSCode as an example)
+.vscode/
+*.code-workspace
+
+# System-specific ignore files
+.DS_Store
+Thumbs.db
+
+
+.devcontainer/.ssh
+certificates
+memory-bank
+.ansible

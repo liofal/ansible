@@ -1,0 +1,32 @@
+---
+- name: Upgrade k3s on Proxmox nodes
+  hosts: proxmox_server
+  become: yes
+  tasks:
+    - name: Upgrade k3s controller node
+      ansible.builtin.shell: |
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "curl -fsSL https://get.k3s.io | sh -s - --disable traefik --node-name {{ hostvars[item].node_name }}"
+      loop: "{{ groups['k3s_controller'] }}"
+      when: groups['k3s_controller'] is defined
+      register: upgrade_controller
+      ignore_errors: true
+
+    - name: Show upgrade result for controller node
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ upgrade_controller.results }}"
+      when: upgrade_controller.results is defined
+
+    - name: Upgrade k3s worker nodes
+      ansible.builtin.shell: |
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "curl -fsL https://get.k3s.io | K3S_URL=https://k3sc1.liofal.net:6443 K3S_TOKEN=abc sh -s - --node-name {{ hostvars[item].node_name }}"
+      loop: "{{ groups['k3s_workers'] }}"
+      when: groups['k3s_workers'] is defined
+      register: upgrade_workers
+      ignore_errors: true
+
+    - name: Show upgrade result for worker nodes
+      ansible.builtin.debug:
+        msg: "{{ item.stdout }}"
+      loop: "{{ upgrade_workers.results }}"
+      when: upgrade_workers.results is defined
