@@ -1,0 +1,30 @@
+---
+- name: Install and Configure dnf-automatic on Rocky Linux containers
+  hosts: proxmox_server
+  gather_facts: true
+  become: true
+  tasks:
+    - name: Ensure dnf-automatic is installed
+      ansible.builtin.shell: | # noqa no-changed-when
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf install -y dnf-automatic"
+      loop: "{{ groups['rockylinux_containers'] }}"
+      when: groups['rockylinux_containers'] is defined
+      changed_when: false
+      # noqa ignore-errors
+
+    - name: Configure dnf-automatic
+      ansible.builtin.shell: | # noqa no-changed-when
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "sed -i 's/^upgrade_type =.*/upgrade_type = default/' /etc/dnf/automatic.conf && \
+        sed -i 's/^apply_updates =.*/apply_updates = yes/' /etc/dnf/automatic.conf"
+      loop: "{{ groups['rockylinux_containers'] }}"
+      when: groups['rockylinux_containers'] is defined
+      changed_when: false
+      # noqa ignore-errors
+
+    - name: Enable and start dnf-automatic timer
+      ansible.builtin.shell: | # noqa no-changed-when
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "systemctl enable --now dnf-automatic.timer"
+      loop: "{{ groups['rockylinux_containers'] }}"
+      when: groups['rockylinux_containers'] is defined
+      changed_when: false
+      # noqa ignore-errors

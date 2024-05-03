@@ -1,0 +1,35 @@
+---
+- name: Check dnf-automatic Installation and Enabled Status via Proxmox
+  hosts: proxmox_server # Target the Proxmox host
+  gather_facts: false
+
+  tasks:
+    - name: Check dnf-automatic status on each Rocky Linux container
+      ansible.builtin.shell: |
+        set -eo pipefail
+        # Check if package is installed (rpm -q exits 0 if installed, 1 if not)
+        if pct exec {{ item.pct_id }} -- rpm -q dnf-automatic > /dev/null 2>&1; then
+          echo "Installed: yes"
+        else
+          echo "Installed: no"
+        fi
+        # Check if timer is enabled (systemctl is-enabled exits 0 if enabled, 1 if not)
+        if pct exec {{ item.pct_id }} -- systemctl is-enabled dnf-automatic.timer > /dev/null 2>&1; then
+          echo "Timer Enabled: yes"
+        else
+          echo "Timer Enabled: no"
+        fi
+      args:
+        executable: /bin/bash
+      register: dnf_status_result
+      loop: "{{ groups['rockylinux_containers'] | map('extract', hostvars) | list }}"
+      loop_control:
+        label: "{{ item.inventory_hostname }}"
+      changed_when: false # This task only checks status
+
+    - name: Display dnf-automatic status for each container
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ dnf_status_result.results }}"
+      loop_control:
+        label: "{{ item.item.inventory_hostname }}"
