@@ -1,0 +1,80 @@
+---
+- name: Update Rocky Linux containers on Proxmox nodes
+  hosts: proxmox_server
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: set directories
+      set_fact:
+        sys_dir: /usr/syno/etc/certificate
+        pkg_dir: /usr/local/etc/certificate
+        stg_dir: /tmp/certs
+
+    - name: create cert staging directory
+      file:
+        path: "{{ stg_dir }}"
+        state: directory
+
+    # certs from previous task
+    - name: stage certs
+      copy:
+        src: "../.certs/{{ item.s }}"
+        dest: "/tmp/certs/{{ item.d }}"
+      with_items:
+        - { s: "{{ domain_name }}.crt",
+            d: "cert.pem" }
+        - { s: "{{ domain_name }}.fullchain", 
+            d: "fullchain.pem" }
+        - { s: "{{ domain_name }}.key",
+            d: "privkey.pem" }
+
+    - name: read the certificate info
+      shell:
+        cmd: jq -r 'to_entries' {{ sys_dir }}/_archive/INFO
+      register: cat_info
+
+    - name: set cert_info
+      set_fact:
+        cert_info: "{{ cat_info.stdout | from_json }}"
+
+    - name: copy staged certs to archives
+      copy:
+        src: "{{ stg_dir }}/"
+        dest: "{{ sys_dir }}/_archive/{{ item.key }}/"
+        remote_src: true
+      with_items: "{{ cert_info | flatten }}"
+      register: certs
+
+    - name: copy certs for packaged services
+      copy:
+        src: "{{ sys_dir }}/_archive/{{ item.0.key }}/"
+        dest: "{{ pkg_dir }}/{{ item.1.subscriber }}/{{ item.1.service }}/"
+        remote_src: true
+      loop: "{{ cert_info | subelements('value.services') }}"
+      when: item.1.isPkg
+
+    - name: copy certs for system services
+      copy:
+        src: "{{ sys_dir }}/_archive/{{ item.0.key }}/"
+        dest: "{{ sys_dir }}/{{ item.1.subscriber }}/{{ item.1.service }}/"
+        remote_src: true
+      loop: "{{ cert_info | subelements('value.services') }}"
+      when: not item.1.isPkg
+      
+    - name: restart affected services
+      shell:
+        cmd: "/usr/syno/sbin/synoservicectl --reload {{ item }}"
+      with_items:
+        # different per server - no doubt you will need to add or 
+        # remove services from this list
+        - nginx                   # DSM
+        - pkgctl-MailServer
+        - pkgctl-SynologyDrive
+        - ftpd
+        - pkgctl-ReplicationService
+      when: certs.changed
+
+    - name: remove cert staging directory
+      file:
+        path: "{{ stg_dir }}"
+        state: absent
