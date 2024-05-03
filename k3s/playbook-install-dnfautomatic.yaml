@@ -1,0 +1,57 @@
+---
+- name: Update Rocky Linux containers on Proxmox nodes
+  hosts: proxmox_server
+  gather_facts: yes
+  become: yes
+  tasks:
+    - name: Update package list on Rocky Linux containers
+      ansible.builtin.shell: |
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf makecache"
+      loop: "{{ groups['rockylinux_containers'] }}"
+      when: groups['rockylinux_containers'] is defined
+      register: update_cache
+      ignore_errors: true
+
+    - name: Ensure dnf-plugins-core is installed (for needs-restarting)
+      ansible.builtin.shell: |
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf install -y dnf-plugins-core"
+      loop: "{{ groups['rockylinux_containers'] }}"
+      when: groups['rockylinux_containers'] is defined
+      ignore_errors: true
+
+    - name: Upgrade packages on Rocky Linux containers
+      ansible.builtin.shell: |
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf -y upgrade"
+      loop: "{{ groups['rockylinux_containers'] }}"
+      when: groups['rockylinux_containers'] is defined
+      register: upgrade_packages
+      ignore_errors: true
+
+    - name: Check if kernel update was applied
+      ansible.builtin.shell: |
+        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf needs-restarting -r; echo $?"
+      loop: "{{ groups['rockylinux_containers'] }}"
+      when: groups['rockylinux_containers'] is defined
+      register: needs_restarting
+      ignore_errors: true
+
+    - name: Reboot the container if kernel update was applied
+      ansible.builtin.shell: |
+        pct exec {{ hostvars[item.item].pct_id }} -- bash -c "reboot"
+      loop: "{{ needs_restarting.results }}"
+      when: 
+        - item.rc == 0 # Assuming rc == 0 is correct; adjust based on actual behavior
+        - "'Reboot is required' in item.stdout" # Check for a specific string indicating a reboot is necessary
+      async: 60
+      poll: 0
+      ignore_errors: true
+      loop_control:
+        label: "{{ item.item }}"
+
+
+    - name: Waiting for container to reboot
+      ansible.builtin.wait_for_connection:
+        delay: 60
+        timeout: 300
+      when: item.stdout != "0"
+      loop: "{{ needs_restarting.results }}"
