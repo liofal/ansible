@@ -1,0 +1,21 @@
+---
+- name: Update Proxmox Host Packages
+  hosts: proxmox_server
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Update apt package cache
+      ansible.builtin.apt:
+        update_cache: yes
+      changed_when: false # Cache update itself isn't a change in system state
+
+    - name: Perform distribution upgrade
+      ansible.builtin.apt:
+        upgrade: dist # Equivalent to apt upgrade, handles dependencies etc.
+        autoremove: yes # Remove packages no longer needed after upgrade
+      register: apt_upgrade_result
+
+    - name: Report upgrade status
+      ansible.builtin.debug:
+        msg: "Proxmox host package upgrade completed. Changes applied: {{ apt_upgrade_result.changed }}"
