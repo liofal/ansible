@@ -1,0 +1,85 @@
+---
+- name: Update Proxmox Host Custom TLS Certificate via Shell
+  hosts: proxmox_server
+  become: true
+  gather_facts: false
+
+  vars:
+    source_cert_path: "/workspaces/ansible/certificates/pveproxy-ssl.pem" # Absolute path in workspace
+    source_key_path: "/workspaces/ansible/certificates/pveproxy-ssl.key"   # Absolute path in workspace
+    dest_dir: "/etc/pve/local/"
+    dest_cert_file: "pveproxy-ssl.pem"
+    dest_key_file: "pveproxy-ssl.key"
+    # Define tmp_dir using epoch time gathered from localhost
+    tmp_dir: "/tmp/pve_cert_upload_{{ ansible_facts.date_time.epoch | default(lookup('pipe', 'date +%s')) }}"
+
+  tasks:
+    - name: Gather date/time facts from localhost for unique tmp dir name
+      ansible.builtin.setup:
+        filter:
+          - ansible_date_time
+      delegate_to: localhost
+      run_once: true # Only need time once
+
+    - name: Check if source certificate file exists locally
+      ansible.builtin.stat:
+        path: "{{ source_cert_path }}"
+      delegate_to: localhost
+      register: source_cert_stat
+
+    - name: Check if source key file exists locally
+      ansible.builtin.stat:
+        path: "{{ source_key_path }}"
+      delegate_to: localhost
+      register: source_key_stat
+
+    - name: Fail if source certificate file is missing
+      ansible.builtin.fail:
+        msg: "Source certificate file not found at {{ source_cert_path }}"
+      when: not source_cert_stat.stat.exists
+
+    - name: Fail if source key file is missing
+      ansible.builtin.fail:
+        msg: "Source key file not found at {{ source_key_path }}"
+      when: not source_key_stat.stat.exists
+
+    - name: Ensure temporary directory exists on remote host
+      ansible.builtin.file:
+        path: "{{ tmp_dir }}"
+        state: directory
+        mode: '0700'
+
+    - name: Copy source certificate to temporary directory on remote host
+      ansible.builtin.copy:
+        src: "{{ source_cert_path }}"
+        dest: "{{ tmp_dir }}/{{ dest_cert_file }}"
+        mode: '0644'
+
+    - name: Copy source key to temporary directory on remote host
+      ansible.builtin.copy:
+        src: "{{ source_key_path }}"
+        dest: "{{ tmp_dir }}/{{ dest_key_file }}"
+        mode: '0600'
+
+    - name: Copy certificate from temp to final destination using shell
+      ansible.builtin.shell:
+        cmd: "cp {{ tmp_dir }}/{{ dest_cert_file }} {{ dest_dir }}{{ dest_cert_file }}" # Removed -p flag
+      changed_when: true # Assume changed if command runs ok
+
+    - name: Copy key from temp to final destination using shell
+      ansible.builtin.shell:
+        cmd: "cp {{ tmp_dir }}/{{ dest_key_file }} {{ dest_dir }}{{ dest_key_file }}" # Removed -p flag
+      changed_when: true # Assume changed if command runs ok
+
+    # Removed chmod tasks as pmxcfs seems to prevent them and might handle permissions internally
+
+    - name: Restart nginx service
+      ansible.builtin.systemd:
+        name: nginx.service # Changed from pveproxy.service
+        state: restarted
+      # Restart unconditionally if we got this far without failing
+
+    - name: Clean up temporary directory
+      ansible.builtin.file:
+        path: "{{ tmp_dir }}"
+        state: absent
