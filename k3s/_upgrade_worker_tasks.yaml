@@ -1,0 +1,59 @@
+---
+# Tasks to upgrade a single k3s worker node (called via include_tasks)
+
+- name: Check current k3s version on worker {{ hostvars[item].node_name }}
+  ansible.builtin.shell: |
+    pct exec {{ hostvars[item].pct_id }} -- /usr/local/bin/k3s --version
+  register: k3s_version_output
+  changed_when: false
+
+- name: Extract k3s version from output for worker {{ hostvars[item].node_name }}
+  ansible.builtin.set_fact:
+    current_k3s_version: "{{ k3s_version_output.stdout | regex_search('k3s version (v[\\d\\.\\+k3s]+)', '\\1') | first | default('') }}"
+
+- name: Display current k3s version for worker {{ hostvars[item].node_name }}
+  ansible.builtin.debug:
+    msg: "Node {{ hostvars[item].node_name }} has k3s version: {{ current_k3s_version }}. Target: {{ k3s_target_version }}"
+
+- name: Drain k3s worker node {{ hostvars[item].node_name }}
+  ansible.builtin.shell: |
+    pct exec {{ hostvars[groups['k3s_controller'][0]].pct_id }} -- \
+    bash -c "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && \
+    /usr/local/bin/kubectl drain {{ hostvars[item].node_name }} --ignore-daemonsets --delete-emptydir-data --disable-eviction --timeout=120s"
+  register: drain_result
+  changed_when: "'node drained' in drain_result.stdout"
+  failed_when: drain_result.rc != 0 and 'already drained' not in drain_result.stderr
+  when: current_k3s_version != k3s_target_version
+
+# noqa pipefail,line-length
+- name: Upgrade k3s worker node {{ hostvars[item].node_name }}
+  ansible.builtin.shell: |
+    pct exec {{ hostvars[item].pct_id }} -- bash -c '\
+      set -o pipefail && \
+      curl -fsL https://get.k3s.io | \
+        INSTALL_K3S_SKIP_SELINUX_RPM=true \
+        K3S_URL=https://k3sc1.liofal.net:6443 \
+        K3S_TOKEN={{ lookup("env", "K3S_TOKEN") }} \
+        sh -s - --node-name {{ hostvars[item].node_name }}'
+  register: upgrade_worker_result
+  changed_when: upgrade_worker_result.stdout | regex_search('Downloading binary|Starting k3s-agent')
+  when: current_k3s_version != k3s_target_version
+
+- name: Show upgrade result for worker node {{ hostvars[item].node_name }}
+  ansible.builtin.debug:
+    msg: "{{ upgrade_worker_result.stdout }}"
+  when:
+    - current_k3s_version != k3s_target_version
+    - upgrade_worker_result.stdout is defined
+    - upgrade_worker_result.stdout != ""
+
+- name: Uncordon k3s worker node {{ hostvars[item].node_name }}
+  ansible.builtin.shell: |
+    pct exec {{ hostvars[groups['k3s_controller'][0]].pct_id }} -- \
+    bash -c "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && \
+    /usr/local/bin/kubectl uncordon {{ hostvars[item].node_name }}"
+  register: uncordon_result
+  changed_when: "'node uncordoned' in uncordon_result.stdout"
+  # Always attempt uncordon, even if drain failed (node might be partially drained or already uncordoned)
+  ignore_errors: true # Consider refining error handling if needed
+  when: current_k3s_version != k3s_target_version
