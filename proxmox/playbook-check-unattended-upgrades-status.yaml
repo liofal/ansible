@@ -1,0 +1,49 @@
+---
+- name: Check Unattended Upgrades Status on Proxmox Host
+  hosts: proxmox_server
+  become: true
+  gather_facts: false # We gather specific facts in tasks
+
+  tasks:
+    - name: Gather package facts
+      ansible.builtin.package_facts:
+        manager: apt
+
+    - name: Check if unattended-upgrades package is installed
+      ansible.builtin.debug:
+        msg: "unattended-upgrades is {{ 'installed' if 'unattended-upgrades' in ansible_facts.packages else 'NOT installed' }} on {{ inventory_hostname }}" # noqa line-length
+
+    - name: End play if package is not installed
+      ansible.builtin.meta: end_play
+      when: "'unattended-upgrades' not in ansible_facts.packages"
+
+    # --- Tasks below only run if package IS installed ---
+
+    - name: Check if unattended upgrades are enabled in APT config
+      ansible.builtin.command: apt-config dump APT::Periodic::Unattended-Upgrade
+      register: apt_config_check
+      changed_when: false
+      failed_when: false # Command might fail if not configured, don't fail the playbook
+
+    - name: Display APT configuration status
+      ansible.builtin.debug:
+        msg: >-
+          APT::Periodic::Unattended-Upgrade is set to
+          '{{ apt_config_check.stdout | regex_search('\\\"(\\d+)\\\"', '\\1') | first | default('Not Set') }}'
+          (Expected '1' for enabled)
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Check unattended-upgrades service status
+      ansible.builtin.debug:
+        msg: >
+          unattended-upgrades service status:
+          State: {{ ansible_facts.services['unattended-upgrades.service'].state | default('unknown') }}
+          Status (enabled/disabled): {{ ansible_facts.services['unattended-upgrades.service'].status | default('not found') }}
+      when: "'unattended-upgrades.service' in ansible_facts.services"
+
+    - name: Notify if service facts not found
+      ansible.builtin.debug:
+        msg: "Could not retrieve status for unattended-upgrades.service"
+      when: "'unattended-upgrades.service' not in ansible_facts.services"
