@@ -6,14 +6,22 @@
     pct exec {{ hostvars[item].pct_id }} -- /usr/local/bin/k3s --version
   register: k3s_version_output
   changed_when: false
+  ignore_errors: true
 
 - name: Extract k3s version from output for worker {{ hostvars[item].node_name }}
   ansible.builtin.set_fact:
     current_k3s_version: "{{ k3s_version_output.stdout | regex_search('k3s version (v[\\d\\.\\+k3s]+)', '\\1') | first | default('') }}"
+  when: not k3s_version_output.failed # Only run if version check succeeded
 
-- name: Display current k3s version for worker {{ hostvars[item].node_name }}
+- name: Display current k3s version for worker {{ hostvars[item].node_name }} (if found)
   ansible.builtin.debug:
     msg: "Node {{ hostvars[item].node_name }} has k3s version: {{ current_k3s_version }}. Target: {{ k3s_target_version }}"
+  when: not k3s_version_output.failed
+
+- name: Display status for worker {{ hostvars[item].node_name }} (if k3s check failed)
+  ansible.builtin.debug:
+    msg: "Node {{ hostvars[item].node_name }}: k3s version check failed (likely not installed). Target: {{ k3s_target_version }}"
+  when: k3s_version_output.failed
 
 - name: Drain k3s worker node {{ hostvars[item].node_name }}
   ansible.builtin.shell: |
@@ -23,7 +31,7 @@
   register: drain_result
   changed_when: "'node drained' in drain_result.stdout"
   failed_when: drain_result.rc != 0 and 'already drained' not in drain_result.stderr
-  when: current_k3s_version != k3s_target_version
+  when: not k3s_version_output.failed and current_k3s_version != k3s_target_version
 
 # noqa pipefail,line-length
 - name: Upgrade k3s worker node {{ hostvars[item].node_name }}
@@ -37,13 +45,13 @@
         sh -s - --node-name {{ hostvars[item].node_name }}'
   register: upgrade_worker_result
   changed_when: upgrade_worker_result.stdout | regex_search('Downloading binary|Starting k3s-agent')
-  when: current_k3s_version != k3s_target_version
+  when: k3s_version_output.failed or current_k3s_version != k3s_target_version
 
 - name: Show upgrade result for worker node {{ hostvars[item].node_name }}
   ansible.builtin.debug:
     msg: "{{ upgrade_worker_result.stdout }}"
   when:
-    - current_k3s_version != k3s_target_version
+    - k3s_version_output.failed or current_k3s_version != k3s_target_version
     - upgrade_worker_result.stdout is defined
     - upgrade_worker_result.stdout != ""
 
@@ -56,4 +64,4 @@
   changed_when: "'node uncordoned' in uncordon_result.stdout"
   # Always attempt uncordon, even if drain failed (node might be partially drained or already uncordoned)
   ignore_errors: true # Consider refining error handling if needed
-  when: current_k3s_version != k3s_target_version
+  when: not k3s_version_output.failed and current_k3s_version != k3s_target_version
