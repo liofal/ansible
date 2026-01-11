@@ -8,17 +8,27 @@
 		"ghcr.io/hspaans/devcontainer-features/ansible-lint:2": {},
 		"ghcr.io/devcontainers-extra/features/ansible:2": {}
 	},
+	"mounts": [
+		"source=${localEnv:HOME}/.codex/,target=/home/vscode/.codex/,type=bind",
+		"source=${localEnv:HOME}/.kube/,target=/home/vscode/.kube/,type=bind",
+		"source=${localWorkspaceFolder}/.devcontainer/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached",
+	],
 	"customizations": {
 		"vscode": {
 			"extensions": [
-				"redhat.ansible"
+				"weaveworks.vscode-gitops-tools",
+				"ms-kubernetes-tools.vscode-kubernetes-tools",
+				"GitLab.gitlab-workflow",
+				"openai.chatgpt",
+				"redhat.ansible",
+				"Anthropic.claude-code"
 			]
 		}
 	},
-
-	"mounts": [
-		"source=${localWorkspaceFolder}/.devcontainer/.ssh,target=/home/vscode/.ssh,type=bind,consistency=cached",
-	],
+	"containerEnv": {
+		"AWS_PROFILE": "SpeosInnovation",
+		"KUBECONFIG": "/home/vscode/.kube/innovation.config"
+	}
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	// "features": {},
