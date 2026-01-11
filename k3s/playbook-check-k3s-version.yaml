@@ -1,12 +1,12 @@
 ---
 - name: Check k3s version on Proxmox nodes
   hosts: proxmox_server
-  gather_facts: yes
-  become: yes
+  gather_facts: false
+  become: false
   tasks:
     - name: Check k3s version on controller node
       ansible.builtin.shell: |
-        pct exec {{ hostvars[item].pct_id }} -- bash -c "/usr/local/bin/k3s --version || echo 'k3s not installed'"
+        sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -c "/usr/local/bin/k3s --version || echo 'k3s not installed'"
       loop: "{{ groups['k3s_controller'] }}"
       when: groups['k3s_controller'] is defined
       register: controller_version
@@ -20,7 +20,7 @@
 
     - name: Check k3s version on worker nodes
       ansible.builtin.shell: |
-        pct exec {{ hostvars[item].pct_id }} -- bash -c "/usr/local/bin/k3s --version || echo 'k3s not installed'"
+        sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -c "/usr/local/bin/k3s --version || echo 'k3s not installed'"
       loop: "{{ groups['k3s_workers'] }}"
       when: groups['k3s_workers'] is defined
       register: worker_version
