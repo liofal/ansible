@@ -7,7 +7,8 @@ This repository contains the Ansible playbooks and configurations for managing a
 - **`/inventory`**: Contains Ansible inventory files, including hosts and group variables, that define the cluster nodes and their roles.
 - **`/k3s`**: Houses playbooks specific to k3s operations such as installation, upgrade, and node management.
   - `playbook-upgrade-k3s.yaml`: An Ansible playbook for upgrading k3s versions across the cluster.
-  - `check-k3s-version.yaml`: A playbook for checking the installed k3s version on all nodes.
+  - `playbook-check-k3s-version.yaml`: A playbook for checking the installed k3s version on all nodes.
+  - `playbook-refresh-k3s-kubeconfig.yaml`: Refreshes local kubeconfig from the controller (and rotates certs if expired).
   - **`K3S.md`**: Detailed documentation on the k3s setup, architecture, and management practices.
 - **`ansible.cfg`**: Ansible configuration file that specifies default settings for the project, including the inventory path.
 - **`README.md`**: Provides an overview of the repository, setup instructions, and how to contribute.

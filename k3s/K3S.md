@@ -42,6 +42,18 @@ Routine maintenance tasks, including backup and monitoring, are outlined here. [
 
 Common issues and their resolutions are documented here to aid in rapid problem identification and resolution. [Include troubleshooting steps for frequent issues encountered in the environment.]
 
+### kubectl auth failure (expired client certificate)
+
+If `kubectl` fails with errors like `x509: certificate has expired or is not yet valid`, refresh your local kubeconfig from the controller:
+
+```bash
+ansible-playbook k3s/playbook-refresh-k3s-kubeconfig.yaml
+```
+
+Notes:
+- The playbook reads `/etc/rancher/k3s/k3s.yaml` from the controller LXC via `pct exec` on the Proxmox host, rewrites the `server:` field to use the controller `node_name`, and writes the result to your first `KUBECONFIG` path (or `~/.kube/k3s-<controller>.config` if `KUBECONFIG` is unset).
+- If the controller's kubeconfig client certificate is already expired, the playbook will stop `k3s`, run `k3s certificate rotate`, and start `k3s` again before re-fetching the kubeconfig. Disable this behavior with `-e k3s_kubeconfig_rotate_if_expired=false`.
+
 ## Contact
 
 For issues not covered in this documentation, please contact [Contact Information].
