@@ -1,49 +1,121 @@
 ---
 - name: Check Unattended Upgrades Status on Proxmox Host
   hosts: proxmox_server
-  become: true
+  become: false
   gather_facts: false # We gather specific facts in tasks
 
   tasks:
-    - name: Gather package facts
-      ansible.builtin.package_facts:
-        manager: apt
+    - name: Check unattended-upgrades package installation status
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - -f=${Status}
+          - unattended-upgrades
+      register: unattended_upgrades_pkg
+      changed_when: false
+      failed_when: false
+
+    - name: Set unattended-upgrades installation fact
+      ansible.builtin.set_fact:
+        unattended_upgrades_installed: "{{ unattended_upgrades_pkg.rc == 0 and 'install ok installed' in unattended_upgrades_pkg.stdout }}"
 
     - name: Check if unattended-upgrades package is installed
       ansible.builtin.debug:
-        msg: "unattended-upgrades is {{ 'installed' if 'unattended-upgrades' in ansible_facts.packages else 'NOT installed' }} on {{ inventory_hostname }}" # noqa line-length
+        msg: "unattended-upgrades is {{ 'installed' if unattended_upgrades_installed else 'NOT installed' }} on {{ inventory_hostname }}" # noqa line-length
 
     - name: End play if package is not installed
-      ansible.builtin.meta: end_play
-      when: "'unattended-upgrades' not in ansible_facts.packages"
+      ansible.builtin.meta: end_host
+      when: not unattended_upgrades_installed
 
     # --- Tasks below only run if package IS installed ---
 
-    - name: Check if unattended upgrades are enabled in APT config
-      ansible.builtin.command: apt-config dump APT::Periodic::Unattended-Upgrade
-      register: apt_config_check
+    - name: Read APT periodic configuration
+      ansible.builtin.command: apt-config dump APT::Periodic
+      register: apt_periodic_config
       changed_when: false
       failed_when: false # Command might fail if not configured, don't fail the playbook
 
-    - name: Display APT configuration status
-      ansible.builtin.debug:
-        msg: >-
-          APT::Periodic::Unattended-Upgrade is set to
-          '{{ apt_config_check.stdout | regex_search('\\\"(\\d+)\\\"', '\\1') | first | default('Not Set') }}'
-          (Expected '1' for enabled)
+    - name: Extract APT periodic values
+      ansible.builtin.set_fact:
+        apt_periodic_update_package_lists: "{{ apt_periodic_config.stdout | regex_search('APT::Periodic::Update-Package-Lists \"([0-9]+)\";', '\\1') | first | default('Not Set') }}"
+        apt_periodic_download_upgradeable_packages: "{{ apt_periodic_config.stdout | regex_search('APT::Periodic::Download-Upgradeable-Packages \"([0-9]+)\";', '\\1') | first | default('Not Set') }}"
+        apt_periodic_unattended_upgrade: "{{ apt_periodic_config.stdout | regex_search('APT::Periodic::Unattended-Upgrade \"([0-9]+)\";', '\\1') | first | default('Not Set') }}"
+        apt_periodic_autoclean_interval: "{{ apt_periodic_config.stdout | regex_search('APT::Periodic::AutocleanInterval \"([0-9]+)\";', '\\1') | first | default('Not Set') }}"
 
-    - name: Gather service facts
-      ansible.builtin.service_facts:
-
-    - name: Check unattended-upgrades service status
+    - name: Display APT periodic configuration status
       ansible.builtin.debug:
-        msg: >
-          unattended-upgrades service status:
-          State: {{ ansible_facts.services['unattended-upgrades.service'].state | default('unknown') }}
-          Status (enabled/disabled): {{ ansible_facts.services['unattended-upgrades.service'].status | default('not found') }}
-      when: "'unattended-upgrades.service' in ansible_facts.services"
+        msg:
+          - "APT::Periodic::Update-Package-Lists={{ apt_periodic_update_package_lists }} (expected '1')"
+          - "APT::Periodic::Download-Upgradeable-Packages={{ apt_periodic_download_upgradeable_packages }} (expected '1')"
+          - "APT::Periodic::Unattended-Upgrade={{ apt_periodic_unattended_upgrade }} (expected '1')"
+          - "APT::Periodic::AutocleanInterval={{ apt_periodic_autoclean_interval }} (expected >= '1')"
 
-    - name: Notify if service facts not found
+    - name: Read unattended-upgrades origin patterns
+      ansible.builtin.command: apt-config dump Unattended-Upgrade::Origins-Pattern
+      register: unattended_origins_config
+      changed_when: false
+      failed_when: false
+
+    - name: Extract unattended-upgrades origin patterns
+      ansible.builtin.set_fact:
+        unattended_origins_patterns: "{{ unattended_origins_config.stdout | regex_findall('\"([^\"]+)\";') }}"
+        unattended_non_security_origins: "{{ (unattended_origins_config.stdout | regex_findall('\"([^\"]+)\";')) | reject('search', 'Debian-Security') | list }}"
+
+    - name: Display unattended-upgrades origin policy status
       ansible.builtin.debug:
-        msg: "Could not retrieve status for unattended-upgrades.service"
-      when: "'unattended-upgrades.service' not in ansible_facts.services"
+        msg:
+          - "Configured Origins-Pattern entries: {{ unattended_origins_patterns }}"
+          - "Non-security origin entries detected: {{ unattended_non_security_origins | default([]) }}"
+          - "Expected for this host: only Debian-Security origins"
+
+    - name: Check enabled state of unattended-upgrades related units
+      ansible.builtin.command: systemctl is-enabled {{ item }}
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - unattended-upgrades.service
+      register: unattended_units_enabled
+      changed_when: false
+      failed_when: false
+
+    - name: Check active state of unattended-upgrades related units
+      ansible.builtin.command: systemctl is-active {{ item }}
+      loop:
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+        - unattended-upgrades.service
+      register: unattended_units_active
+      changed_when: false
+      failed_when: false
+
+    - name: Display unattended-upgrades related unit status
+      ansible.builtin.debug:
+        msg:
+          - "apt-daily.timer: enabled={{ unattended_units_enabled.results[0].stdout | default('unknown') }}, active={{ unattended_units_active.results[0].stdout | default('unknown') }}"
+          - "apt-daily-upgrade.timer: enabled={{ unattended_units_enabled.results[1].stdout | default('unknown') }}, active={{ unattended_units_active.results[1].stdout | default('unknown') }}"
+          - "unattended-upgrades.service: enabled={{ unattended_units_enabled.results[2].stdout | default('unknown') }}, active={{ unattended_units_active.results[2].stdout | default('unknown') }}"
+
+    - name: Simulate upgrade to detect pending Proxmox package updates
+      ansible.builtin.command: apt-get -s upgrade
+      register: apt_simulated_upgrade
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: apt_simulated_upgrade.rc == 0
+
+    - name: Extract pending Proxmox package updates
+      ansible.builtin.set_fact:
+        pending_proxmox_updates: >-
+          {{
+            apt_simulated_upgrade.stdout_lines
+            | select('match', '^Inst ')
+            | select('search', 'Proxmox Debian Repository|pve-no-subscription|pve-enterprise')
+            | list
+          }}
+
+    - name: Display pending Proxmox package updates
+      ansible.builtin.debug:
+        msg:
+          - "Pending Proxmox package updates: {{ pending_proxmox_updates | length }}"
+          - "{{ pending_proxmox_updates }}"
