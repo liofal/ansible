@@ -16,6 +16,11 @@ This document outlines the management practices for the Proxmox Virtual Environm
 Ansible playbooks are used to automate key management tasks on the Proxmox host:
 
 - **Package Upgrades:** `proxmox/playbook-upgrade-proxmox.yaml` handles system package updates.
+- **Major Upgrades (8 to 9):**
+    - `proxmox/playbook-precheck-proxmox-8to9.yaml`
+    - `proxmox/playbook-prepare-proxmox-8to9.yaml`
+    - `proxmox/playbook-upgrade-proxmox-8to9.yaml`
+    - `proxmox/playbook-postcheck-proxmox-8to9.yaml`
 - **Certificate Updates:** `proxmox/playbook-update-proxmox-certificate.yaml` manages the custom TLS certificate used by the Proxmox web UI/API.
 - **Status Checks:**
     - `proxmox/playbook-check-unattended-upgrades-status.yaml` checks the status of the `unattended-upgrades` package.
@@ -33,7 +38,7 @@ Ansible playbooks are used to automate key management tasks on the Proxmox host:
 
 ## Maintenance Procedures
 
-- **Host Upgrades:** Performed using `proxmox/playbook-upgrade-proxmox.yaml`.
+- **Host Upgrades:** Routine upgrades are handled by `proxmox/playbook-upgrade-proxmox.yaml`; major 8->9 migrations use the dedicated staged playbooks listed above.
 - **Backups:** [Details on Proxmox host backup strategy, if any]
 - **Monitoring:** [Details on Proxmox host monitoring, if any]
 
@@ -42,7 +47,7 @@ Ansible playbooks are used to automate key management tasks on the Proxmox host:
 Common issues related to managing the Proxmox host via Ansible and their resolutions.
 
 - **Certificate Update Failures:** Often related to `pmxcfs` restrictions. Ensure the correct workaround pattern is used and `nginx.service` is restarted.
-- **Playbook Failures:** Check SSH connectivity, user permissions (`root` access required), and playbook syntax.
+- **Playbook Failures:** Check SSH connectivity, sudoers permissions for the allowed command set, and playbook syntax.
 
 ## Contact
 
