@@ -119,3 +119,41 @@
         msg:
           - "Pending Proxmox package updates: {{ pending_proxmox_updates | length }}"
           - "{{ pending_proxmox_updates }}"
+
+    - name: Check whether reboot is required by the system
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_flag
+
+    - name: Read packages requesting reboot
+      ansible.builtin.command: cat /var/run/reboot-required.pkgs
+      register: reboot_required_pkgs
+      changed_when: false
+      failed_when: false
+      when: reboot_required_flag.stat.exists
+
+    - name: Read running kernel version
+      ansible.builtin.command: uname -r
+      register: running_kernel
+      changed_when: false
+
+    - name: Read latest installed signed Proxmox kernel version
+      ansible.builtin.shell: |
+        dpkg -l | grep -E '^ii[[:space:]]+proxmox-kernel-[0-9].*-pve-signed' \
+          | awk '{print $2}' \
+          | sed 's/^proxmox-kernel-//' \
+          | sort -V \
+          | tail -n 1
+      args:
+        executable: /bin/bash
+      register: latest_installed_proxmox_kernel
+      changed_when: false
+      failed_when: false
+
+    - name: Display reboot requirement status
+      ansible.builtin.debug:
+        msg:
+          - "reboot_required={{ reboot_required_flag.stat.exists }}"
+          - "running_kernel={{ running_kernel.stdout | trim }}"
+          - "latest_installed_proxmox_kernel={{ latest_installed_proxmox_kernel.stdout | trim | default('unknown') }}"
+          - "reboot_required_by_packages={{ reboot_required_pkgs.stdout_lines | default([]) }}"
