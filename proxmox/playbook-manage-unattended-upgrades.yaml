@@ -1,0 +1,132 @@
+---
+- name: Manage Unattended Upgrades on Proxmox Host
+  hosts: proxmox_server
+  become: false
+  gather_facts: false
+
+  vars:
+    unattended_upgrades_update_package_lists: "1"
+    unattended_upgrades_download_upgradeable_packages: "1"
+    unattended_upgrades_unattended_upgrade: "1"
+    unattended_upgrades_autoclean_interval: "7"
+    unattended_upgrades_remove_unused_dependencies: "true"
+    unattended_upgrades_automatic_reboot: "false"
+    unattended_upgrades_20auto_content: |
+      APT::Periodic::Update-Package-Lists "{{ unattended_upgrades_update_package_lists }}";
+      APT::Periodic::Download-Upgradeable-Packages "{{ unattended_upgrades_download_upgradeable_packages }}";
+      APT::Periodic::Unattended-Upgrade "{{ unattended_upgrades_unattended_upgrade }}";
+      APT::Periodic::AutocleanInterval "{{ unattended_upgrades_autoclean_interval }}";
+    unattended_upgrades_50_content: |
+      // Managed by Ansible: security-only unattended-upgrades policy.
+      Unattended-Upgrade::Origins-Pattern {
+              "origin=Debian,codename=${distro_codename},label=Debian-Security";
+              "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
+      };
+
+      Unattended-Upgrade::Package-Blacklist {
+      };
+    unattended_upgrades_52local_content: |
+      Unattended-Upgrade::Remove-Unused-Dependencies "{{ unattended_upgrades_remove_unused_dependencies }}";
+      Unattended-Upgrade::Automatic-Reboot "{{ unattended_upgrades_automatic_reboot }}";
+
+  tasks:
+    - name: Refresh APT package metadata
+      ansible.builtin.command: sudo -n /usr/bin/apt-get update
+      register: apt_update_result
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: apt_update_result.rc == 0
+
+    - name: Install unattended-upgrades package via apt-get
+      ansible.builtin.command: sudo -n /usr/bin/apt-get install -y unattended-upgrades
+      register: apt_install_result
+      changed_when: "'already the newest version' not in apt_install_result.stdout"
+      retries: 6
+      delay: 10
+      until: apt_install_result.rc == 0
+
+    - name: Read current /etc/apt/apt.conf.d/20auto-upgrades
+      ansible.builtin.command: sudo -n /bin/cat /etc/apt/apt.conf.d/20auto-upgrades
+      register: current_20auto
+      changed_when: false
+      failed_when: false
+
+    - name: Update /etc/apt/apt.conf.d/20auto-upgrades when content differs
+      ansible.builtin.shell: |
+        cat <<'EOF' | sudo -n /usr/bin/tee /etc/apt/apt.conf.d/20auto-upgrades >/dev/null
+        {{ unattended_upgrades_20auto_content }}
+        EOF
+      args:
+        executable: /bin/bash
+      when: current_20auto.stdout | trim != unattended_upgrades_20auto_content | trim
+
+    - name: Read current /etc/apt/apt.conf.d/52unattended-upgrades-local
+      ansible.builtin.command: sudo -n /bin/cat /etc/apt/apt.conf.d/52unattended-upgrades-local
+      register: current_52local
+      changed_when: false
+      failed_when: false
+
+    - name: Read current /etc/apt/apt.conf.d/50unattended-upgrades
+      ansible.builtin.command: sudo -n /bin/cat /etc/apt/apt.conf.d/50unattended-upgrades
+      register: current_50unattended
+      changed_when: false
+      failed_when: false
+
+    - name: Update /etc/apt/apt.conf.d/50unattended-upgrades when content differs
+      ansible.builtin.shell: |
+        cat <<'EOF' | sudo -n /usr/bin/tee /etc/apt/apt.conf.d/50unattended-upgrades >/dev/null
+        {{ unattended_upgrades_50_content }}
+        EOF
+      args:
+        executable: /bin/bash
+      when: current_50unattended.stdout | trim != unattended_upgrades_50_content | trim
+
+    - name: Update /etc/apt/apt.conf.d/52unattended-upgrades-local when content differs
+      ansible.builtin.shell: |
+        cat <<'EOF' | sudo -n /usr/bin/tee /etc/apt/apt.conf.d/52unattended-upgrades-local >/dev/null
+        {{ unattended_upgrades_52local_content }}
+        EOF
+      args:
+        executable: /bin/bash
+      when: current_52local.stdout | trim != unattended_upgrades_52local_content | trim
+
+    - name: Check apt-daily.timer enabled state
+      ansible.builtin.command: sudo -n /bin/systemctl is-enabled apt-daily.timer
+      register: apt_daily_enabled
+      changed_when: false
+      failed_when: false
+
+    - name: Check apt-daily.timer active state
+      ansible.builtin.command: sudo -n /bin/systemctl is-active apt-daily.timer
+      register: apt_daily_active
+      changed_when: false
+      failed_when: false
+
+    - name: Enable and start apt-daily.timer
+      ansible.builtin.command: sudo -n /bin/systemctl enable --now apt-daily.timer
+      when: apt_daily_enabled.stdout != "enabled" or apt_daily_active.stdout != "active"
+
+    - name: Check apt-daily-upgrade.timer enabled state
+      ansible.builtin.command: sudo -n /bin/systemctl is-enabled apt-daily-upgrade.timer
+      register: apt_daily_upgrade_enabled
+      changed_when: false
+      failed_when: false
+
+    - name: Check apt-daily-upgrade.timer active state
+      ansible.builtin.command: sudo -n /bin/systemctl is-active apt-daily-upgrade.timer
+      register: apt_daily_upgrade_active
+      changed_when: false
+      failed_when: false
+
+    - name: Enable and start apt-daily-upgrade.timer
+      ansible.builtin.command: sudo -n /bin/systemctl enable --now apt-daily-upgrade.timer
+      when: apt_daily_upgrade_enabled.stdout != "enabled" or apt_daily_upgrade_active.stdout != "active"
+
+    - name: Report unattended-upgrades management result
+      ansible.builtin.debug:
+        msg:
+          - "unattended-upgrades package is installed"
+          - "APT periodic settings are managed in /etc/apt/apt.conf.d/20auto-upgrades"
+          - "Security-only origins policy is managed in /etc/apt/apt.conf.d/50unattended-upgrades"
+          - "Local unattended-upgrades overrides are managed in /etc/apt/apt.conf.d/52unattended-upgrades-local"
