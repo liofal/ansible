@@ -1,0 +1,90 @@
+---
+- name: Prepare Proxmox VE 8 Host for 8 to 9 Migration
+  hosts: proxmox_server
+  become: false
+  gather_facts: false
+  serial: 1
+
+  vars:
+    pve_prepare_expected_major: "8"
+    pve_prepare_run_dist_upgrade: true
+    pve_prepare_reboot_if_required: false
+
+  tasks:
+    - name: Read current Proxmox version
+      ansible.builtin.command: /usr/bin/pveversion
+      register: pveversion_cmd
+      changed_when: false
+
+    - name: Extract current Proxmox major version
+      ansible.builtin.set_fact:
+        pve_current_major: "{{ pveversion_cmd.stdout | regex_search('pve-manager/(\\d+)\\.', '\\1') | first | default('unknown') }}"
+
+    - name: Assert host is currently on expected source major version
+      ansible.builtin.assert:
+        that:
+          - pve_current_major == pve_prepare_expected_major
+        fail_msg: "Prepare phase expects Proxmox {{ pve_prepare_expected_major }}. Current: {{ pveversion_cmd.stdout }}"
+        success_msg: "Prepare phase running on Proxmox {{ pve_current_major }}"
+
+    - name: Refresh APT package metadata
+      ansible.builtin.command: sudo -n /usr/bin/apt-get update
+      register: apt_update_cmd
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: apt_update_cmd.rc == 0
+
+    - name: Upgrade host packages while still on source major
+      ansible.builtin.command: sudo -n /usr/bin/apt-get dist-upgrade -y
+      register: apt_dist_upgrade_cmd
+      changed_when: "'0 upgraded, 0 newly installed, 0 to remove' not in apt_dist_upgrade_cmd.stdout"
+      retries: 6
+      delay: 10
+      until: apt_dist_upgrade_cmd.rc == 0
+      when: pve_prepare_run_dist_upgrade | bool
+
+    - name: Remove obsolete packages
+      ansible.builtin.command: sudo -n /usr/bin/apt-get autoremove -y
+      register: apt_autoremove_cmd
+      changed_when: "'0 to remove' not in apt_autoremove_cmd.stdout"
+      retries: 3
+      delay: 10
+      until: apt_autoremove_cmd.rc == 0
+      when: pve_prepare_run_dist_upgrade | bool
+
+    - name: Check whether reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_flag
+
+    - name: Reboot after prepare phase when requested and required
+      ansible.builtin.command: sudo -n /usr/sbin/shutdown -r now "Ansible prepare phase reboot for Proxmox 8->9"
+      async: 1
+      poll: 0
+      changed_when: true
+      when:
+        - pve_prepare_reboot_if_required | bool
+        - reboot_required_flag.stat.exists
+
+    - name: Wait for host to come back after prepare reboot
+      ansible.builtin.wait_for_connection:
+        delay: 20
+        sleep: 10
+        timeout: 900
+      when:
+        - pve_prepare_reboot_if_required | bool
+        - reboot_required_flag.stat.exists
+
+    - name: Read Proxmox version after prepare phase
+      ansible.builtin.command: /usr/bin/pveversion
+      register: pveversion_after_prepare
+      changed_when: false
+
+    - name: Report prepare summary
+      ansible.builtin.debug:
+        msg:
+          - "pveversion_before={{ pveversion_cmd.stdout }}"
+          - "pveversion_after={{ pveversion_after_prepare.stdout }}"
+          - "reboot_required={{ reboot_required_flag.stat.exists }}"
+          - "reboot_performed={{ (pve_prepare_reboot_if_required | bool) and (reboot_required_flag.stat.exists) }}"

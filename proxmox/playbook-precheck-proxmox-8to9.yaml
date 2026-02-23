@@ -1,0 +1,116 @@
+---
+- name: Precheck Proxmox VE 8 to 9 Migration Readiness
+  hosts: proxmox_server
+  become: false
+  gather_facts: false
+  serial: 1
+
+  vars:
+    pve_expected_source_major: "8"
+    pve_expected_source_codename: "bookworm"
+    pve_precheck_fail_on_warn: false
+
+  tasks:
+    - name: Verify sudo policy can be queried non-interactively
+      ansible.builtin.command: sudo -n -l
+      register: sudo_list_cmd
+      changed_when: false
+
+    - name: Read current Proxmox version
+      ansible.builtin.command: /usr/bin/pveversion
+      register: pveversion_cmd
+      changed_when: false
+
+    - name: Extract current Proxmox major version
+      ansible.builtin.set_fact:
+        pve_current_major: "{{ pveversion_cmd.stdout | regex_search('pve-manager/(\\d+)\\.', '\\1') | first | default('unknown') }}"
+
+    - name: Assert host is currently on supported source major version
+      ansible.builtin.assert:
+        that:
+          - pve_current_major == pve_expected_source_major
+        fail_msg: "Expected Proxmox major {{ pve_expected_source_major }} before migration, got {{ pve_current_major }} ({{ pveversion_cmd.stdout }})"
+        success_msg: "Host is on supported source major version {{ pve_current_major }}"
+
+    - name: Read Debian codename from /etc/os-release
+      ansible.builtin.shell: . /etc/os-release && echo "${VERSION_CODENAME:-unknown}"
+      args:
+        executable: /bin/bash
+      register: debian_codename_cmd
+      changed_when: false
+
+    - name: Assert expected source Debian codename
+      ansible.builtin.assert:
+        that:
+          - debian_codename_cmd.stdout | trim == pve_expected_source_codename
+        fail_msg: "Expected Debian codename {{ pve_expected_source_codename }}, got {{ debian_codename_cmd.stdout | trim }}"
+        success_msg: "Debian codename is {{ debian_codename_cmd.stdout | trim }}"
+
+    - name: Run official Proxmox pre-upgrade checker
+      ansible.builtin.command: sudo -n /usr/bin/pve8to9 --full
+      register: pve8to9_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Stop when pve8to9 cannot be executed
+      ansible.builtin.fail:
+        msg:
+          - "Unable to execute /usr/bin/pve8to9 --full as root."
+          - "stderr={{ pve8to9_cmd.stderr | default('') }}"
+          - "Ensure sudoers allows this command for user '{{ ansible_user | default('ansible') }}'."
+      when: pve8to9_cmd.rc != 0
+
+    - name: Parse pve8to9 output for FAIL and WARN lines
+      ansible.builtin.set_fact:
+        pve8to9_fail_lines: "{{ pve8to9_cmd.stdout_lines | select('search', '^FAIL:') | list }}"
+        pve8to9_warn_lines: "{{ pve8to9_cmd.stdout_lines | select('search', '^WARN:') | list }}"
+
+    - name: Stop when pve8to9 reports FAIL entries
+      ansible.builtin.fail:
+        msg:
+          - "pve8to9 reported blocking FAIL entries:"
+          - "{{ pve8to9_fail_lines }}"
+      when: pve8to9_fail_lines | length > 0
+
+    - name: Stop when pve8to9 reports WARN entries and strict mode is enabled
+      ansible.builtin.fail:
+        msg:
+          - "pve8to9 reported WARN entries and pve_precheck_fail_on_warn=true:"
+          - "{{ pve8to9_warn_lines }}"
+      when:
+        - pve_precheck_fail_on_warn | bool
+        - pve8to9_warn_lines | length > 0
+
+    - name: Read root filesystem and boot free space
+      ansible.builtin.shell: |
+        for mount in / /boot /var/lib/vz; do
+          if [ -d "$mount" ]; then
+            df -h "$mount"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: disk_space_cmd
+      changed_when: false
+
+    - name: Read VM inventory
+      ansible.builtin.command: sudo -n /usr/sbin/qm list
+      register: qm_list_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether reboot is currently required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_flag
+
+    - name: Report precheck summary
+      ansible.builtin.debug:
+        msg:
+          - "pveversion={{ pveversion_cmd.stdout }}"
+          - "debian_codename={{ debian_codename_cmd.stdout | trim }}"
+          - "pve8to9_fail_count={{ pve8to9_fail_lines | length }}"
+          - "pve8to9_warn_count={{ pve8to9_warn_lines | length }}"
+          - "reboot_required_now={{ reboot_required_flag.stat.exists }}"
+          - "vm_inventory_available={{ qm_list_cmd.rc == 0 }}"
+          - "disk_free_overview={{ disk_space_cmd.stdout_lines }}"

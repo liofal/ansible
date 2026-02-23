@@ -1,0 +1,139 @@
+---
+- name: Upgrade Proxmox VE Host from 8 to 9
+  hosts: proxmox_server
+  become: false
+  gather_facts: false
+  serial: 1
+
+  vars:
+    pve_upgrade_source_major: "8"
+    pve_upgrade_target_major: "9"
+    pve_upgrade_source_codename: "bookworm"
+    pve_upgrade_target_codename: "trixie"
+    pve_upgrade_confirmation_required: "UPGRADE_TO_PVE9"
+    pve_upgrade_confirmation: ""
+    pve_upgrade_reboot: true
+
+  tasks:
+    - name: Require explicit confirmation variable
+      ansible.builtin.assert:
+        that:
+          - pve_upgrade_confirmation == pve_upgrade_confirmation_required
+        fail_msg: >-
+          This playbook performs a major upgrade.
+          Set -e "pve_upgrade_confirmation={{ pve_upgrade_confirmation_required }}"
+          to continue.
+
+    - name: Read current Proxmox version
+      ansible.builtin.command: /usr/bin/pveversion
+      register: pveversion_cmd
+      changed_when: false
+
+    - name: Extract current Proxmox major version
+      ansible.builtin.set_fact:
+        pve_current_major: "{{ pveversion_cmd.stdout | regex_search('pve-manager/(\\d+)\\.', '\\1') | first | default('unknown') }}"
+
+    - name: Assert host is on expected source major version
+      ansible.builtin.assert:
+        that:
+          - pve_current_major == pve_upgrade_source_major
+        fail_msg: "Expected Proxmox {{ pve_upgrade_source_major }} before upgrade. Current: {{ pveversion_cmd.stdout }}"
+
+    - name: Run pre-upgrade checker and capture result
+      ansible.builtin.command: sudo -n /usr/bin/pve8to9 --full
+      register: pve8to9_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Parse pve8to9 output for blocking failures
+      ansible.builtin.set_fact:
+        pve8to9_fail_lines: "{{ pve8to9_cmd.stdout_lines | select('search', '^FAIL:') | list }}"
+
+    - name: Stop upgrade when pve8to9 reports FAIL entries
+      ansible.builtin.fail:
+        msg:
+          - "pve8to9 reported blocking FAIL entries:"
+          - "{{ pve8to9_fail_lines }}"
+      when: pve8to9_fail_lines | length > 0
+
+    - name: Backup apt source files before codename switch
+      ansible.builtin.shell: |
+        set -euo pipefail
+        stamp="$(date +%Y%m%d%H%M%S)"
+        target="/root/ansible-upgrade-backups/pve8to9-${stamp}"
+        sudo -n /bin/mkdir -p "$target"
+        if [ -f /etc/apt/sources.list ]; then
+          sudo -n /bin/cp -a /etc/apt/sources.list "$target/sources.list"
+        fi
+        if [ -d /etc/apt/sources.list.d ]; then
+          sudo -n /bin/cp -a /etc/apt/sources.list.d "$target/sources.list.d"
+        fi
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Switch apt sources codename from source to target release
+      ansible.builtin.shell: |
+        set -euo pipefail
+        files="/etc/apt/sources.list /etc/apt/sources.list.d/*.list"
+        for f in $files; do
+          [ -f "$f" ] || continue
+          sudo -n /bin/sed -i "s/{{ pve_upgrade_source_codename }}/{{ pve_upgrade_target_codename }}/g" "$f"
+        done
+      args:
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Refresh APT package metadata after repo switch
+      ansible.builtin.command: sudo -n /usr/bin/apt-get update
+      register: apt_update_cmd
+      changed_when: false
+      retries: 6
+      delay: 10
+      until: apt_update_cmd.rc == 0
+
+    - name: Perform full distribution upgrade to target major
+      ansible.builtin.command: sudo -n /usr/bin/apt-get dist-upgrade -y
+      register: apt_dist_upgrade_cmd
+      changed_when: "'0 upgraded, 0 newly installed, 0 to remove' not in apt_dist_upgrade_cmd.stdout"
+      retries: 6
+      delay: 10
+      until: apt_dist_upgrade_cmd.rc == 0
+
+    - name: Remove obsolete packages after major upgrade
+      ansible.builtin.command: sudo -n /usr/bin/apt-get autoremove -y
+      register: apt_autoremove_cmd
+      changed_when: "'0 to remove' not in apt_autoremove_cmd.stdout"
+      retries: 3
+      delay: 10
+      until: apt_autoremove_cmd.rc == 0
+
+    - name: Reboot host after major upgrade
+      ansible.builtin.command: sudo -n /usr/sbin/shutdown -r now "Ansible Proxmox 8->9 upgrade reboot"
+      async: 1
+      poll: 0
+      changed_when: true
+      when: pve_upgrade_reboot | bool
+
+    - name: Wait for host to come back after upgrade reboot
+      ansible.builtin.wait_for_connection:
+        delay: 30
+        sleep: 10
+        timeout: 1200
+      when: pve_upgrade_reboot | bool
+
+    - name: Read Proxmox version after major upgrade
+      ansible.builtin.command: /usr/bin/pveversion
+      register: pveversion_after_upgrade
+      changed_when: false
+
+    - name: Extract upgraded Proxmox major version
+      ansible.builtin.set_fact:
+        pve_upgraded_major: "{{ pveversion_after_upgrade.stdout | regex_search('pve-manager/(\\d+)\\.', '\\1') | first | default('unknown') }}"
+
+    - name: Assert host is on target Proxmox major version
+      ansible.builtin.assert:
+        that:
+          - pve_upgraded_major == pve_upgrade_target_major
+        fail_msg: "Upgrade finished but target major {{ pve_upgrade_target_major }} was not detected. Current: {{ pveversion_after_upgrade.stdout }}"
+        success_msg: "Host upgraded successfully to Proxmox major {{ pve_upgraded_major }}"
