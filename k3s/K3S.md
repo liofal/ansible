@@ -19,7 +19,7 @@ K3s installation within LXC containers is managed through Ansible. The installat
 
 Upgrades are performed using the `k3s/playbook-upgrade-k3s.yaml` Ansible playbook. The process is designed to be idempotent and minimize disruption:
 
-1.  **Target Version Determination:** The playbook automatically determines the latest stable K3s version by querying the `https://update.k3s.io/v1-release/channels/stable` endpoint.
+1.  **Target Version Determination:** By default, the playbook determines the target K3s version from the `stable` channel (`https://update.k3s.io/v1-release/channels/stable`) using JSON response data (`tag_name`). You can pin a specific version with `-e k3s_target_version=vX.Y.Z+k3sN`.
 2.  **Node Version Check:** It checks the currently installed K3s version on each node (`/usr/local/bin/k3s --version`).
 3.  **Conditional Upgrade:** The upgrade steps are only performed if the node's current version does not match the target version.
 4.  **Worker Node Upgrade Order:** Worker nodes are upgraded first, one by one.
@@ -27,6 +27,7 @@ Upgrades are performed using the `k3s/playbook-upgrade-k3s.yaml` Ansible playboo
     *   **Upgrade:** The standard K3s upgrade script (`curl | sh`) is executed on the worker node via `pct exec`.
     *   **Uncordon:** The worker node is uncordoned using `kubectl uncordon` executed on the controller node via `pct exec`.
 5.  **Controller Node Upgrade:** The controller node is upgraded last by executing the K3s upgrade script directly via `pct exec`. Draining is skipped for the single controller setup.
+6.  **Post-Upgrade Smoke Check:** Run `k3s/playbook-postcheck-k3s-upgrade.yaml` to assert all nodes are `Ready` and no pods are stuck outside `Running/Completed`.
 
 This ensures worker nodes are gracefully handled, and upgrades only occur when necessary.
 

@@ -8,6 +8,7 @@ This repository contains the Ansible playbooks and configurations for managing a
 - **`/k3s`**: Houses playbooks specific to k3s operations such as installation, upgrade, and node management.
   - `playbook-upgrade-k3s.yaml`: An Ansible playbook for upgrading k3s versions across the cluster.
   - `playbook-check-k3s-version.yaml`: A playbook for checking the installed k3s version on all nodes.
+  - `playbook-postcheck-k3s-upgrade.yaml`: A post-upgrade smoke check (node readiness + pod health).
   - `playbook-refresh-k3s-kubeconfig.yaml`: Refreshes local kubeconfig from the controller (and rotates certs if expired).
   - **`K3S.md`**: Detailed documentation on the k3s setup, architecture, and management practices.
 - **`ansible.cfg`**: Ansible configuration file that specifies default settings for the project, including the inventory path.
@@ -22,7 +23,8 @@ To manage your k3s cluster, you'll need to set up your environment with Ansible 
 3. **Set Up Inventory**: Populate the `/inventory/hosts.ini` file with your Proxmox and k3s node details. Refer to `./inventory/notes.md` for guidance on the inventory structure.
 4. **Run Playbooks**: Execute Ansible playbooks to manage your cluster. For example, to check k3s versions on all nodes, run:
    ```bash
-   ansible-playbook k3s/check-k3s-version.yaml
+   ansible-playbook k3s/playbook-check-k3s-version.yaml
+   ```
 
 ## Setting Up SSH Access
 

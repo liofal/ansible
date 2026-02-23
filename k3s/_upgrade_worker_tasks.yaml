@@ -3,14 +3,14 @@
 
 - name: Check current k3s version on worker {{ hostvars[item].node_name }}
   ansible.builtin.shell: |
-    sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- /usr/local/bin/k3s --version
+    sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -c "/usr/local/bin/k3s --version | head -n1 | cut -d' ' -f3"
   register: k3s_version_output
   changed_when: false
   ignore_errors: true
 
 - name: Extract k3s version from output for worker {{ hostvars[item].node_name }}
   ansible.builtin.set_fact:
-    current_k3s_version: "{{ k3s_version_output.stdout | regex_search('k3s version (v[\\d\\.\\+k3s]+)', '\\1') | first | default('') }}"
+    current_k3s_version: "{{ k3s_version_output.stdout | trim }}"
   when: not k3s_version_output.failed # Only run if version check succeeded
 
 - name: Display current k3s version for worker {{ hostvars[item].node_name }} (if found)
@@ -40,6 +40,7 @@
       set -o pipefail && \
       curl -fsL https://get.k3s.io | \
         INSTALL_K3S_SKIP_SELINUX_RPM=true \
+        INSTALL_K3S_VERSION={{ k3s_target_version }} \
         K3S_URL=https://k3sc1.liofal.net:6443 \
         K3S_TOKEN={{ k3s_token }} \
         sh -s - --node-name {{ hostvars[item].node_name }}'

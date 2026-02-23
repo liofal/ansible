@@ -1,0 +1,91 @@
+---
+- name: Post-check k3s cluster health after upgrade
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+
+  tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in the [k3s_controller] group."
+
+    - name: Set controller context facts
+      ansible.builtin.set_fact:
+        k3s_controller_host: "{{ groups['k3s_controller'] | first }}"
+        k3s_controller_pct_id: "{{ hostvars[groups['k3s_controller'] | first].pct_id }}"
+      run_once: true
+
+    - name: Read node table from k3s controller
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get nodes -o wide
+      register: k3s_nodes_wide
+      changed_when: false
+
+    - name: Read k3s node readiness status
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get nodes --no-headers | awk '{print $1"\t"$2}'
+      register: k3s_nodes_status
+      changed_when: false
+
+    - name: Build list of non-Ready nodes
+      ansible.builtin.set_fact:
+        k3s_non_ready_nodes: "{{ k3s_nodes_status.stdout_lines | reject('equalto', '') | reject('search', '\tReady$') | list }}"
+
+    - name: Fail when one or more nodes are not Ready
+      ansible.builtin.assert:
+        that:
+          - k3s_non_ready_nodes | length == 0
+        fail_msg: "Detected non-Ready nodes: {{ k3s_non_ready_nodes | join(', ') }}"
+        success_msg: "All k3s nodes are Ready."
+
+    - name: Read k3s pod status table
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get pods -A --no-headers | awk '{print $1"/"$2"\t"$4}'
+      register: k3s_pods_status
+      changed_when: false
+
+    - name: Build list of unhealthy pods
+      ansible.builtin.set_fact:
+        k3s_unhealthy_pods: "{{ k3s_pods_status.stdout_lines | reject('equalto', '') | reject('search', '\t(Running|Completed|Succeeded)$') | list }}"
+
+    - name: Fail when unhealthy pods are present
+      ansible.builtin.assert:
+        that:
+          - k3s_unhealthy_pods | length == 0
+        fail_msg: "Detected non-healthy pods: {{ k3s_unhealthy_pods | join(', ') }}"
+        success_msg: "All pods are in Running/Completed state."
+
+    - name: Report post-upgrade cluster summary
+      ansible.builtin.debug:
+        msg:
+          - "Controller: {{ hostvars[k3s_controller_host].node_name | default(k3s_controller_host, true) }}"
+          - "Node inventory:"
+          - "{{ k3s_nodes_wide.stdout }}"
+          - "Unhealthy pod count: {{ k3s_unhealthy_pods | length }}"

@@ -3,6 +3,10 @@
   hosts: proxmox_server
   gather_facts: false
   become: false
+  vars:
+    # Optional: set with -e k3s_target_version=vX.Y.Z+k3sN to pin a specific version.
+    k3s_target_version: ""
+    k3s_release_channel: "stable"
   pre_tasks:
     - name: Determine K3s shared token
       ansible.builtin.set_fact:
@@ -15,31 +19,62 @@
       ansible.builtin.fail:
         msg: "K3S_TOKEN is missing. Export it in your environment or add it to .env."
       when: k3s_token | length == 0
-  # Removed hardcoded k3s_target_version var
   tasks:
+    - name: Normalize optional target version override
+      ansible.builtin.set_fact:
+        k3s_target_version: "{{ k3s_target_version | trim }}"
+      run_once: true
+
     - name: Get latest stable K3s version from update endpoint
       ansible.builtin.uri:
-        url: https://update.k3s.io/v1-release/channels/stable
+        url: "https://update.k3s.io/v1-release/channels/{{ k3s_release_channel }}"
+        headers:
+          Accept: "application/json"
+        follow_redirects: all
         return_content: true
       register: k3s_stable_channel_info
       run_once: true
-      delegate_to: localhost # Run this on the control node
+      delegate_to: localhost
+      when: k3s_target_version | length == 0
 
     - name: Extract latest K3s version string from endpoint response
       ansible.builtin.set_fact:
-        # Extracts version like v1.2.3+k3s1 from '<h1 ...>v1.2.3+k3s1</h1>'
-        k3s_target_version: "{{ k3s_stable_channel_info.content | regex_search('<h1[^>]*>(v[\\d\\.\\+k3s]+)<\\/h1>', '\\1') | first | default('') }}"
+        k3s_target_version: >-
+          {{
+            (
+              k3s_stable_channel_info.json.tag_name
+              | default(
+                  (
+                    k3s_stable_channel_info.content
+                    | regex_findall('"tag_name"\\s*:\\s*"([^"]+)"')
+                    | first
+                    | default('')
+                  ),
+                  true
+                )
+            ) | trim
+          }}
       run_once: true
+      when: k3s_target_version | length == 0
 
     - name: Fail if target version could not be determined
       ansible.builtin.fail:
-        msg: "Could not determine the target K3s version from the update endpoint. Raw content: {{ k3s_stable_channel_info.content }}"
+        msg: >-
+          Could not determine the target K3s version.
+          Provide -e k3s_target_version=vX.Y.Z+k3sN, or check update endpoint response.
       when: k3s_target_version == ''
+      run_once: true
+
+    - name: Validate target K3s version format
+      ansible.builtin.assert:
+        that:
+          - k3s_target_version is match('^v[0-9]+\\.[0-9]+\\.[0-9]+\\+k3s[0-9]+$')
+        fail_msg: "k3s_target_version '{{ k3s_target_version }}' is not a valid k3s version string."
       run_once: true
 
     - name: Display determined target K3s version
       ansible.builtin.debug:
-        msg: "Determined target K3s version: {{ k3s_target_version }}"
+        msg: "Target K3s version: {{ k3s_target_version }} (channel={{ k3s_release_channel }})"
       run_once: true
 
     - name: Include worker upgrade tasks
@@ -52,7 +87,7 @@
     # Controller upgrade must happen AFTER workers, as controller is needed for kubectl drain/uncordon
     - name: Check current k3s version on controller {{ hostvars[item].node_name }}
       ansible.builtin.shell: |
-        sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- /usr/local/bin/k3s --version
+        sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -c "/usr/local/bin/k3s --version | head -n1 | cut -d' ' -f3"
       loop: "{{ groups['k3s_controller'] }}"
       when: groups['k3s_controller'] is defined
       register: k3s_controller_version_output
@@ -60,42 +95,46 @@
       loop_control:
         label: "{{ hostvars[item].node_name }}"
 
-    - name: Extract k3s version from output for controller {{ hostvars[item].node_name }}
+    - name: Build controller version inventory for comparison
       ansible.builtin.set_fact:
-        current_k3s_version: "{{ item.stdout | regex_search('k3s version (v[\\d\\.\\+k3s]+)', '\\1') | first | default('') }}"
+        k3s_controller_versions: >-
+          {{
+            (k3s_controller_versions | default([]))
+            + [{
+              'host': item.item,
+              'current': (item.stdout | trim)
+            }]
+          }}
       loop: "{{ k3s_controller_version_output.results }}"
       when: k3s_controller_version_output.results is defined
       loop_control:
-        label: "{{ hostvars[item.item].node_name }}" # Access original item via item.item
+        label: "{{ hostvars[item.item].node_name }}"
 
-    - name: Display current k3s version for controller {{ hostvars[item].node_name }}
+    - name: Display current k3s version for controller {{ hostvars[item.host].node_name }}
       ansible.builtin.debug:
-        msg: "Node {{ hostvars[item.item].node_name }} has k3s version: {{ current_k3s_version }}. Target: {{ k3s_target_version }}"
-      loop: "{{ k3s_controller_version_output.results }}"
-      when: k3s_controller_version_output.results is defined
+        msg: "Node {{ hostvars[item.host].node_name }} has k3s version: {{ item.current | default('unknown', true) }}. Target: {{ k3s_target_version }}"
+      loop: "{{ k3s_controller_versions | default([]) }}"
       loop_control:
-        label: "{{ hostvars[item.item].node_name }}" # Access original item via item.item
+        label: "{{ hostvars[item.host].node_name }}"
 
     # noqa pipefail
-    - name: Upgrade k3s controller node {{ hostvars[item].node_name }}
+    - name: Upgrade k3s controller node {{ hostvars[item.host].node_name }}
       ansible.builtin.shell: |
-        sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -c "set -o pipefail && curl -fsL https://get.k3s.io | \
-        INSTALL_K3S_SKIP_SELINUX_RPM=true sh -s - --disable traefik --node-name {{ hostvars[item].node_name }}"
-      loop: "{{ groups['k3s_controller'] }}"
-      when:
-        - groups['k3s_controller'] is defined
-        - current_k3s_version != k3s_target_version # Only run if version mismatch
+        sudo /usr/sbin/pct exec {{ hostvars[item.host].pct_id }} -- bash -c "set -o pipefail && curl -fsL https://get.k3s.io | \
+        INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_VERSION={{ k3s_target_version }} sh -s - --disable traefik --node-name {{ hostvars[item.host].node_name }}"
+      loop: "{{ k3s_controller_versions | default([]) }}"
+      when: item.current != k3s_target_version
       register: upgrade_controller_result
       changed_when: upgrade_controller_result.stdout | regex_search('Downloading binary|Starting k3s')
       loop_control:
-        label: "{{ hostvars[item].node_name }}"
+        label: "{{ hostvars[item.host].node_name }}"
 
-    - name: Show upgrade result for controller node {{ hostvars[item].node_name }}
+    - name: Show upgrade result for controller node {{ hostvars[item.item.host].node_name }}
       ansible.builtin.debug:
         msg: "{{ item.stdout }}"
-      loop: "{{ upgrade_controller_result.results }}"
+      loop: "{{ upgrade_controller_result.results | default([]) }}"
       when:
-        - upgrade_controller_result.results is defined
-        - current_k3s_version != k3s_target_version # Only show if upgrade was attempted
+        - item.stdout is defined
+        - item.stdout != ""
       loop_control:
-        label: "{{ hostvars[item.item].node_name }}" # Access original item via item.item
+        label: "{{ hostvars[item.item.host].node_name }}"
