@@ -8,13 +8,13 @@
       ansible.builtin.shell: |
         set -eo pipefail
         # Check if package is installed (rpm -q exits 0 if installed, 1 if not)
-        if pct exec {{ item.pct_id }} -- rpm -q dnf-automatic > /dev/null 2>&1; then
+        if sudo -n /usr/sbin/pct exec {{ item.pct_id }} -- rpm -q dnf-automatic > /dev/null 2>&1; then
           echo "Installed: yes"
         else
           echo "Installed: no"
         fi
         # Check if timer is enabled (systemctl is-enabled exits 0 if enabled, 1 if not)
-        if pct exec {{ item.pct_id }} -- systemctl is-enabled dnf-automatic.timer > /dev/null 2>&1; then
+        if sudo -n /usr/sbin/pct exec {{ item.pct_id }} -- systemctl is-enabled dnf-automatic.timer > /dev/null 2>&1; then
           echo "Timer Enabled: yes"
         else
           echo "Timer Enabled: no"

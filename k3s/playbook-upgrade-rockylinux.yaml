@@ -1,59 +1,47 @@
 ---
 - name: Update Rocky Linux containers on Proxmox nodes
   hosts: proxmox_server
-  gather_facts: true
-  become: true
-  serial: 1
+  gather_facts: false
+  become: false
   tasks:
     - name: Update package list on Rocky Linux containers
-      ansible.builtin.shell: | # noqa no-changed-when
-        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf makecache"
+      ansible.builtin.shell: |
+        sudo -n /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -lc "dnf -q makecache --refresh"
       loop: "{{ groups['rockylinux_containers'] }}"
       when: groups['rockylinux_containers'] is defined
       register: update_cache
       changed_when: false
 
     - name: Ensure dnf-plugins-core is installed (for needs-restarting)
-      ansible.builtin.shell: | # noqa no-changed-when
-        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf install -y dnf-plugins-core"
+      ansible.builtin.shell: |
+        sudo -n /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -lc "dnf -y install dnf-plugins-core"
       loop: "{{ groups['rockylinux_containers'] }}"
       when: groups['rockylinux_containers'] is defined
       changed_when: false
 
     - name: Upgrade packages on Rocky Linux containers
-      ansible.builtin.shell: | # noqa no-changed-when
-        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf -y upgrade"
+      ansible.builtin.shell: |
+        sudo -n /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -lc "dnf -y upgrade"
       loop: "{{ groups['rockylinux_containers'] }}"
       when: groups['rockylinux_containers'] is defined
       register: upgrade_packages
-      changed_when: false
+      changed_when: "'Nothing to do.' not in upgrade_packages.stdout"
 
-    - name: Check if kernel update was applied
-      ansible.builtin.shell: | # noqa no-changed-when
-        pct exec {{ hostvars[item].pct_id }} -- bash -c "dnf needs-restarting -r; echo $?"
+    - name: Check whether container restart is recommended
+      ansible.builtin.shell: |
+        sudo -n /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -lc "dnf needs-restarting -r >/dev/null 2>&1; echo $?"
       loop: "{{ groups['rockylinux_containers'] }}"
       when: groups['rockylinux_containers'] is defined
-      register: needs_restarting
+      register: restart_recommended
       changed_when: false
 
-    - name: Reboot the container if kernel update was applied
-      ansible.builtin.shell: | # noqa no-changed-when
-        pct exec {{ hostvars[item.item].pct_id }} -- bash -c "reboot"
-      loop: "{{ needs_restarting.results }}"
-      when:
-        - item.rc == 1 # Corrected condition based on dnf needs-restarting -r exit code
-        - "'Reboot is required' in item.stdout" # Check for a specific string indicating a reboot is necessary
-      async: 10
-      poll: 0
-      changed_when: false
+    - name: Report package upgrade and restart recommendation summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item }}:
+          upgraded={{ 'yes' if ('Nothing to do.' not in item.stdout) else 'no' }},
+          restart_recommended={{ 'yes' if (restart_recommended.results[ansible_loop.index0].stdout | trim) == '1' else 'no' }}
+      loop: "{{ upgrade_packages.results }}"
       loop_control:
         label: "{{ item.item }}"
-
-
-    - name: Waiting for container to reboot
-      ansible.builtin.wait_for_connection: # noqa no-changed-when
-        delay: 10
-        timeout: 300
-      when: item.stdout != "0"
-      loop: "{{ needs_restarting.results }}"
-      changed_when: false
+        extended: true
