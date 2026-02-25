@@ -1,6 +1,11 @@
 ---
 # Tasks to upgrade a single k3s worker node (called via include_tasks)
 
+- name: Ensure /dev/kmsg compatibility service exists in worker {{ hostvars[item].node_name }}
+  ansible.builtin.include_tasks: _ensure_worker_kmsg_tasks.yaml
+  vars:
+    k3s_target_worker_pct_id: "{{ hostvars[item].pct_id }}"
+
 - name: Check current k3s version on worker {{ hostvars[item].node_name }}
   ansible.builtin.shell: |
     sudo /usr/sbin/pct exec {{ hostvars[item].pct_id }} -- bash -c "/usr/local/bin/k3s --version | head -n1 | cut -d' ' -f3"

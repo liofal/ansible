@@ -90,37 +90,11 @@
       register: k3s_worker_version
       changed_when: false
       failed_when: false
+    - name: Ensure /dev/kmsg compatibility service exists in target worker
+      ansible.builtin.include_tasks: _ensure_worker_kmsg_tasks.yaml
+      vars:
+        k3s_target_worker_pct_id: "{{ k3s_worker_pct_id }}"
 
-    - name: Ensure conf-kmsg helper script exists in target worker
-      ansible.builtin.command:
-        argv:
-          - sudo
-          - /usr/sbin/pct
-          - exec
-          - "{{ k3s_worker_pct_id }}"
-          - --
-          - bash
-          - -lc
-          - >-
-            printf '%s\n' '#!/bin/sh' 'if [ ! -e /dev/kmsg ]; then' '  ln -s /dev/console /dev/kmsg' 'fi' > /usr/local/bin/conf-kmsg.sh &&
-            chmod +x /usr/local/bin/conf-kmsg.sh
-      changed_when: false
-
-    - name: Ensure conf-kmsg service is enabled in target worker
-      ansible.builtin.command:
-        argv:
-          - sudo
-          - /usr/sbin/pct
-          - exec
-          - "{{ k3s_worker_pct_id }}"
-          - --
-          - bash
-          - -lc
-          - >-
-            printf '%s\n' '[Unit]' 'Description=Make sure /dev/kmsg exists' '' '[Service]' 'Type=oneshot' 'RemainAfterExit=yes' 'ExecStart=/usr/local/bin/conf-kmsg.sh' '' '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/conf-kmsg.service &&
-            systemctl daemon-reload &&
-            systemctl enable --now conf-kmsg.service
-      changed_when: false
 
     - name: Check whether target worker node already exists in cluster
       ansible.builtin.command:

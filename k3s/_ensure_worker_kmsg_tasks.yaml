@@ -1,0 +1,41 @@
+---
+# Ensure /dev/kmsg compatibility inside an LXC worker container.
+# Requires `k3s_target_worker_pct_id` to be set by caller.
+
+- name: Ensure target worker pct_id is provided for kmsg setup
+  ansible.builtin.assert:
+    that:
+      - k3s_target_worker_pct_id is defined
+      - (k3s_target_worker_pct_id | string | trim | length) > 0
+    fail_msg: "k3s_target_worker_pct_id must be set before including _ensure_worker_kmsg_tasks.yaml."
+
+- name: Ensure conf-kmsg helper script exists in target worker
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - /usr/sbin/pct
+      - exec
+      - "{{ k3s_target_worker_pct_id }}"
+      - --
+      - bash
+      - -lc
+      - >-
+        printf '%s\n' '#!/bin/sh' 'if [ ! -e /dev/kmsg ]; then' '  ln -s /dev/console /dev/kmsg' 'fi' > /usr/local/bin/conf-kmsg.sh &&
+        chmod +x /usr/local/bin/conf-kmsg.sh
+  changed_when: false
+
+- name: Ensure conf-kmsg service is enabled in target worker
+  ansible.builtin.command:
+    argv:
+      - sudo
+      - /usr/sbin/pct
+      - exec
+      - "{{ k3s_target_worker_pct_id }}"
+      - --
+      - bash
+      - -lc
+      - >-
+        printf '%s\n' '[Unit]' 'Description=Make sure /dev/kmsg exists' '' '[Service]' 'Type=oneshot' 'RemainAfterExit=yes' 'ExecStart=/usr/local/bin/conf-kmsg.sh' '' '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/conf-kmsg.service &&
+        systemctl daemon-reload &&
+        systemctl enable --now conf-kmsg.service
+  changed_when: false
