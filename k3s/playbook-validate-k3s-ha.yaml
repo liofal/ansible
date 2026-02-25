@@ -1,0 +1,136 @@
+---
+- name: Validate K3s HA control-plane state
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    k3s_primary_controller_host: "{{ groups['k3s_controller'] | first }}"
+    k3s_primary_controller_node_name: "{{ hostvars[k3s_primary_controller_host].node_name | default(k3s_primary_controller_host, true) }}"
+    k3s_primary_controller_pct_id: "{{ hostvars[k3s_primary_controller_host].pct_id }}"
+
+    # Optional: create etcd snapshot as part of validation
+    k3s_ha_take_snapshot: false
+
+  tasks:
+    - name: Ensure inventory defines at least three k3s controllers
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) >= 3
+        fail_msg: "Inventory should define three hosts in [k3s_controller] for HA validation."
+
+    - name: Assert primary controller has etcd role
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ k3s_primary_controller_node_name }} --no-headers | awk '{print $3}'
+      register: k3s_primary_roles
+      changed_when: false
+
+    - name: Fail if primary controller is not etcd-enabled
+      ansible.builtin.assert:
+        that:
+          - "'etcd' in (k3s_primary_roles.stdout | trim)"
+        fail_msg: "Primary controller roles are '{{ k3s_primary_roles.stdout | trim }}', expected to include etcd."
+
+    - name: Wait for each controller node to be Ready
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl wait --for=condition=Ready node/{{ hostvars[item].node_name }} --timeout=300s
+      loop: "{{ groups['k3s_controller'] }}"
+      changed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Read roles for each controller node
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ hostvars[item].node_name }} --no-headers | awk '{print $3}'
+      loop: "{{ groups['k3s_controller'] }}"
+      register: k3s_controller_roles
+      changed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Assert each controller has etcd role
+      ansible.builtin.assert:
+        that:
+          - "'etcd' in (item.stdout | trim)"
+        fail_msg: "Controller {{ item.item }} roles are '{{ item.stdout | trim }}', expected to include etcd."
+      loop: "{{ k3s_controller_roles.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Read detailed node table
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get nodes -o wide
+      register: k3s_nodes_wide
+      changed_when: false
+
+    - name: Read kube-system pod table
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get pods -n kube-system -o wide
+      register: k3s_kube_system_pods
+      changed_when: false
+
+    - name: Optionally create etcd snapshot
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - /usr/local/bin/k3s etcd-snapshot save --name ansible-ha-{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}
+      when: k3s_ha_take_snapshot | bool
+      register: k3s_snapshot_result
+      changed_when: true
+
+    - name: Show HA validation summary
+      ansible.builtin.debug:
+        msg:
+          - "Primary controller: {{ k3s_primary_controller_node_name }}"
+          - "Node inventory:"
+          - "{{ k3s_nodes_wide.stdout }}"
+          - "kube-system pods:"
+          - "{{ k3s_kube_system_pods.stdout }}"
+          - >-
+            Snapshot status: {{ (k3s_snapshot_result.stdout | default('skipped', true)) if (k3s_ha_take_snapshot | bool) else 'skipped' }}

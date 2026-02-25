@@ -1,0 +1,310 @@
+---
+- name: Join additional K3s controllers as HA servers
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    k3s_primary_controller_host: "{{ groups['k3s_controller'] | first }}"
+    k3s_primary_controller_node_name: "{{ hostvars[k3s_primary_controller_host].node_name | default(k3s_primary_controller_host, true) }}"
+    k3s_primary_controller_pct_id: "{{ hostvars[k3s_primary_controller_host].pct_id }}"
+
+    # Override if needed, e.g. -e k3s_server_url=https://k3s-api.liofal.net:6443
+    k3s_server_url: "https://{{ k3s_primary_controller_node_name }}:6443"
+
+    # Optional pin, e.g. -e k3s_target_version=v1.34.4+k3s1
+    k3s_target_version: ""
+
+  tasks:
+    - name: Ensure inventory defines at least two k3s controllers
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 1
+        fail_msg: "Inventory must define at least two hosts in [k3s_controller] to run HA join."
+
+    - name: Assert primary controller has etcd role before join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ k3s_primary_controller_node_name }} --no-headers | awk '{print $3}'
+      register: k3s_primary_roles
+      changed_when: false
+
+    - name: Fail if primary controller is not etcd-enabled yet
+      ansible.builtin.assert:
+        that:
+          - "'etcd' in (k3s_primary_roles.stdout | trim)"
+        fail_msg: >-
+          Primary controller roles are '{{ k3s_primary_roles.stdout | trim }}'.
+          Run k3s/playbook-bootstrap-k3s-ha.yaml first.
+
+    - name: Build list of additional controllers to join
+      ansible.builtin.set_fact:
+        k3s_join_controller_hosts: "{{ groups['k3s_controller'][1:] }}"
+
+    - name: Read shared K3s server token from primary controller
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - cat
+          - /var/lib/rancher/k3s/server/token
+      register: k3s_server_token_raw
+      changed_when: false
+      no_log: true
+
+    - name: Resolve target K3s version (from primary if not provided)
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - /usr/local/bin/k3s --version | head -n1 | awk '{print $3}'
+      register: k3s_primary_version
+      changed_when: false
+      when: (k3s_target_version | trim) == ''
+
+    - name: Set effective target K3s version
+      ansible.builtin.set_fact:
+        k3s_target_version_effective: >-
+          {{
+            (k3s_target_version | trim)
+            if (k3s_target_version | trim) != ''
+            else (k3s_primary_version.stdout | trim)
+          }}
+
+    - name: Validate effective target K3s version format
+      ansible.builtin.assert:
+        that:
+          - k3s_target_version_effective is match('^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$')
+        fail_msg: "Resolved K3s version '{{ k3s_target_version_effective }}' is invalid."
+
+    - name: Check current k3s binary version on additional controllers
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ hostvars[item].pct_id }}"
+          - --
+          - bash
+          - -lc
+          - /usr/local/bin/k3s --version | head -n1 | awk '{print $3}'
+      loop: "{{ k3s_join_controller_hosts }}"
+      register: k3s_join_current_versions
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Check k3s service state on additional controllers
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ hostvars[item].pct_id }}"
+          - --
+          - systemctl
+          - is-active
+          - k3s
+      loop: "{{ k3s_join_controller_hosts }}"
+      register: k3s_join_service_states
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Read node status/roles for additional controllers
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ hostvars[item].node_name }} --no-headers | awk '{print $2 "|" $3}'
+      loop: "{{ k3s_join_controller_hosts }}"
+      register: k3s_join_node_states
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Build join status list for additional controllers
+      vars:
+        k3s_service_probe: "{{ (k3s_join_service_states.results | selectattr('item', 'equalto', item.item) | first | default({})) }}"
+        k3s_node_probe: "{{ (k3s_join_node_states.results | selectattr('item', 'equalto', item.item) | first | default({})) }}"
+        k3s_node_state: "{{ ((k3s_node_probe.stdout | default('')) | trim) }}"
+      ansible.builtin.set_fact:
+        k3s_join_status: >-
+          {{
+            (k3s_join_status | default([]))
+            + [{
+              'host': item.item,
+              'node_name': (hostvars[item.item].node_name | default(item.item, true)),
+              'current_version': (item.stdout | trim),
+              'service_active': ((k3s_service_probe.stdout | default('')) | trim),
+              'registered': ((k3s_node_probe.rc | default(1)) == 0),
+              'node_state': k3s_node_state,
+              'ready': ((k3s_node_probe.rc | default(1)) == 0) and (k3s_node_state is match('^Ready\\|')),
+              'has_etcd_role': ((k3s_node_probe.rc | default(1)) == 0) and ('etcd' in k3s_node_state),
+              'needs_join': (
+                ((item.stdout | trim) != k3s_target_version_effective)
+                or (((k3s_service_probe.stdout | default('')) | trim) != 'active')
+                or ((k3s_node_probe.rc | default(1)) != 0)
+                or not (k3s_node_state is match('^Ready\\|'))
+                or not ('etcd' in k3s_node_state)
+              )
+            }]
+          }}
+      loop: "{{ k3s_join_current_versions.results }}"
+      loop_control:
+        label: "{{ hostvars[item.item].node_name | default(item.item, true) }}"
+
+    - name: Show join plan summary
+      ansible.builtin.debug:
+        msg: >-
+          Node={{ item.node_name }} current={{ item.current_version | default('not installed', true) }}
+          service={{ item.service_active | default('unknown', true) }}
+          registered={{ 'yes' if item.registered else 'no' }}
+          ready={{ 'yes' if item.ready else 'no' }}
+          roles={{ item.node_state | default('n/a', true) }}
+          join={{ 'yes' if item.needs_join else 'no' }}
+          target={{ k3s_target_version_effective }}
+      loop: "{{ k3s_join_status | default([]) }}"
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    # noqa command-instead-of-module
+    - name: Join/reconfigure additional controller nodes to HA cluster
+      ansible.builtin.shell: |
+        sudo /usr/sbin/pct exec {{ hostvars[item.host].pct_id }} -- bash -lc "set -o pipefail && curl -fsL https://get.k3s.io | \
+        INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_VERSION={{ k3s_target_version_effective }} K3S_TOKEN='{{ k3s_server_token_raw.stdout | trim }}' \
+        sh -s - server --server {{ k3s_server_url }} --node-name {{ item.node_name }}"
+      loop: "{{ k3s_join_status | default([]) }}"
+      when: item.needs_join
+      register: k3s_join_result
+      changed_when: "(stdout | default('')) is regex('Downloading binary|Installing k3s|Starting k3s')"
+      no_log: true
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    - name: Wait for k3s service to be active on additional controllers
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ hostvars[item.host].pct_id }}"
+          - --
+          - systemctl
+          - is-active
+          - k3s
+      loop: "{{ k3s_join_status | default([]) }}"
+      changed_when: false
+      register: k3s_join_service_active
+      retries: 60
+      delay: 2
+      until: (k3s_join_service_active.stdout | trim) == 'active'
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    - name: Wait for joined controllers to be registered in Kubernetes
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ item.node_name }} --no-headers
+      loop: "{{ k3s_join_status | default([]) }}"
+      changed_when: false
+      register: k3s_join_wait_registered
+      retries: 60
+      delay: 2
+      until: k3s_join_wait_registered.rc == 0
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    - name: Wait for joined controllers to report Ready in Kubernetes
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl wait --for=condition=Ready node/{{ item.node_name }} --timeout=300s
+      loop: "{{ k3s_join_status | default([]) }}"
+      changed_when: false
+      retries: 3
+      delay: 5
+      register: k3s_join_wait_ready
+      until: k3s_join_wait_ready.rc == 0
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    - name: Read roles for joined controllers
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ item.node_name }} --no-headers | awk '{print $3}'
+      loop: "{{ k3s_join_status | default([]) }}"
+      register: k3s_join_roles_after
+      changed_when: false
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    - name: Assert joined controllers have etcd role
+      ansible.builtin.assert:
+        that:
+          - "'etcd' in (item.stdout | trim)"
+        fail_msg: "Node {{ item.item.node_name }} roles are '{{ item.stdout | trim }}' but expected to include etcd."
+      loop: "{{ k3s_join_roles_after.results }}"
+      loop_control:
+        label: "{{ item.item.node_name }}"
+
+    - name: Display current k3s node list after join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get nodes -o wide
+      register: k3s_nodes_after_join
+      changed_when: false
+
+    - name: Show current node list after join
+      ansible.builtin.debug:
+        msg: "{{ k3s_nodes_after_join.stdout }}"

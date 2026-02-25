@@ -58,3 +58,35 @@ Notes:
 ## Contact
 
 For issues not covered in this documentation, please contact [Contact Information].
+
+## HA Migration Workflow (Terraform + Ansible)
+
+For HA rollout, keep responsibilities split:
+- **Terraform**: Provision and size controller/worker LXCs.
+- **Ansible**: Configure and validate K3s control-plane lifecycle.
+
+Recommended Ansible sequence:
+
+1. Bootstrap/convert primary controller to embedded etcd (idempotent):
+
+```bash
+ansible-playbook k3s/playbook-bootstrap-k3s-ha.yaml
+```
+
+2. Join additional controllers as server nodes:
+
+```bash
+ansible-playbook k3s/playbook-join-k3s-ha-servers.yaml
+```
+
+3. Validate HA state and optionally create etcd snapshot:
+
+```bash
+ansible-playbook k3s/playbook-validate-k3s-ha.yaml
+# optional snapshot
+ansible-playbook k3s/playbook-validate-k3s-ha.yaml -e k3s_ha_take_snapshot=true
+```
+
+Notes:
+- If no API load balancer/VIP exists yet, use the primary controller URL for initial join.
+- DNS round-robin works as temporary lab mode but is not health-aware failover.

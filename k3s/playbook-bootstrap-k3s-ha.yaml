@@ -1,0 +1,126 @@
+---
+- name: Bootstrap K3s embedded-etcd HA on primary controller
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    k3s_primary_controller_host: "{{ groups['k3s_controller'] | first }}"
+    k3s_primary_controller_node_name: "{{ hostvars[k3s_primary_controller_host].node_name | default(k3s_primary_controller_host, true) }}"
+    k3s_primary_controller_pct_id: "{{ hostvars[k3s_primary_controller_host].pct_id }}"
+
+  tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in the [k3s_controller] group."
+
+    - name: Read primary controller node roles from Kubernetes
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ k3s_primary_controller_node_name }} --no-headers | awk '{print $3}'
+      register: k3s_primary_roles_before
+      changed_when: false
+
+    - name: Derive datastore mode from node roles
+      ansible.builtin.set_fact:
+        k3s_datastore_mode: "{{ 'etcd' if ('etcd' in (k3s_primary_roles_before.stdout | trim)) else 'sqlite' }}"
+
+    - name: Show current datastore mode
+      ansible.builtin.debug:
+        msg: "Primary controller {{ k3s_primary_controller_node_name }} datastore: {{ k3s_datastore_mode }}"
+
+    - name: Ensure /etc/rancher/k3s exists on primary controller
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - mkdir
+          - -p
+          - /etc/rancher/k3s
+      when: k3s_datastore_mode == 'sqlite'
+
+    - name: Ensure cluster-init is present in k3s config when currently sqlite
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - |
+            if [ -f /etc/rancher/k3s/config.yaml ] && grep -Eq '^[[:space:]]*cluster-init:[[:space:]]*true[[:space:]]*$' /etc/rancher/k3s/config.yaml; then
+              echo "already_set"
+            else
+              printf '\ncluster-init: true\n' >> /etc/rancher/k3s/config.yaml
+              echo "updated"
+            fi
+      register: k3s_cluster_init_config
+      changed_when: (k3s_cluster_init_config.stdout | trim) == 'updated'
+      when: k3s_datastore_mode == 'sqlite'
+
+    - name: Restart k3s after enabling cluster-init
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - systemctl
+          - restart
+          - k3s
+      when: k3s_datastore_mode == 'sqlite'
+
+    - name: Wait for k3s service to be active on primary controller
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - systemctl
+          - is-active
+          - k3s
+      register: k3s_service_active_check
+      changed_when: false
+      retries: 60
+      delay: 2
+      until: (k3s_service_active_check.stdout | trim) == 'active'
+      when: k3s_datastore_mode == 'sqlite'
+
+    - name: Read primary controller node roles after bootstrap
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get node {{ k3s_primary_controller_node_name }} --no-headers | awk '{print $3}'
+      register: k3s_primary_roles_after
+      changed_when: false
+
+    - name: Assert primary controller has etcd role after bootstrap
+      ansible.builtin.assert:
+        that:
+          - "'etcd' in (k3s_primary_roles_after.stdout | trim)"
+        fail_msg: >-
+          Expected primary controller to have etcd role after bootstrap, got roles='{{ k3s_primary_roles_after.stdout | trim }}'.
+        success_msg: "Primary controller is using embedded etcd."
