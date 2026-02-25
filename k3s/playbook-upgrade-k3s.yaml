@@ -13,7 +13,7 @@
         k3s_token: "{{ lookup('env', 'K3S_TOKEN') | default(env_token_from_file, true) }}"
       vars:
         env_contents: "{{ lookup('file', '../.env', errors='ignore') | default('') }}"
-        env_token_from_file: "{{ env_contents | regex_search('(?:export\\s+)?K3S_TOKEN=([^\\n]+)', '\\1') | default('', true) }}"
+        env_token_from_file: "{{ (env_contents | regex_findall('(?:export\\s+)?K3S_TOKEN=([^\\n]+)') | first | default('', true) | trim | regex_replace('^\"|\"$', '')) }}"
 
     - name: Fail if K3s shared token is unavailable
       ansible.builtin.fail:

@@ -54,7 +54,7 @@
         k3s_token: "{{ lookup('env', 'K3S_TOKEN') | default(env_token_from_file, true) }}"
       vars:
         env_contents: "{{ lookup('file', '../.env', errors='ignore') | default('') }}"
-        env_token_from_file: "{{ env_contents | regex_search('(?:export\\s+)?K3S_TOKEN=([^\\n]+)', '\\1') | default('', true) }}"
+        env_token_from_file: "{{ (env_contents | regex_findall('(?:export\\s+)?K3S_TOKEN=([^\\n]+)') | first | default('', true) | trim | regex_replace('^\"|\"$', '')) }}"
 
     - name: Fail if K3s shared token is unavailable
       ansible.builtin.fail:
@@ -91,6 +91,54 @@
       changed_when: false
       failed_when: false
 
+    - name: Ensure conf-kmsg helper script exists in target worker
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_worker_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            printf '%s\n' '#!/bin/sh' 'if [ ! -e /dev/kmsg ]; then' '  ln -s /dev/console /dev/kmsg' 'fi' > /usr/local/bin/conf-kmsg.sh &&
+            chmod +x /usr/local/bin/conf-kmsg.sh
+      changed_when: false
+
+    - name: Ensure conf-kmsg service is enabled in target worker
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_worker_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            printf '%s\n' '[Unit]' 'Description=Make sure /dev/kmsg exists' '' '[Service]' 'Type=oneshot' 'RemainAfterExit=yes' 'ExecStart=/usr/local/bin/conf-kmsg.sh' '' '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/conf-kmsg.service &&
+            systemctl daemon-reload &&
+            systemctl enable --now conf-kmsg.service
+      changed_when: false
+
+    - name: Check whether target worker node already exists in cluster
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get node {{ k3s_worker_node_name }} --no-headers
+      register: k3s_worker_node_present
+      changed_when: false
+      failed_when: false
+
     # noqa pipefail
     - name: Install or update k3s agent on target worker
       ansible.builtin.shell: |
@@ -104,8 +152,23 @@
             sh -s - --node-name {{ k3s_worker_node_name }}'
       register: k3s_join_result
       changed_when: k3s_join_result.stdout | regex_search('Downloading binary|Starting k3s-agent')
-      when: (k3s_worker_version.stdout | default('', true) | trim) != (k3s_controller_version.stdout | trim)
+      when: >-
+        (k3s_worker_version.stdout | default('', true) | trim) != (k3s_controller_version.stdout | trim)
+        or (k3s_worker_node_present.rc != 0)
       no_log: true
+
+    - name: Ensure k3s-agent service is running in target worker
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_worker_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - systemctl restart k3s-agent
+      changed_when: false
 
     - name: Wait for target worker node to become Ready
       ansible.builtin.command:
