@@ -39,7 +39,7 @@
     - name: Discover latest Rocky Linux 10 appliance archive
       ansible.builtin.shell: |
         set -o pipefail
-        sudo -n /usr/bin/pveam available {{ k3s_template_storage }} \
+        sudo -n /usr/bin/pveam available --section system \
           | awk '{print $2}' \
           | grep -E '^rockylinux-10-default_[0-9]{8}_[a-z0-9]+\.tar\.(xz|zst)$' \
           | sort -V \
@@ -220,6 +220,10 @@
       when:
         - not (k3s_template_skip_build | default(false))
         - k3s_template_update_packages | bool
+      register: template_makecache
+      retries: 3
+      delay: 10
+      until: template_makecache.rc == 0
       changed_when: false
 
     - name: Upgrade packages inside template CT
@@ -239,6 +243,9 @@
         - k3s_template_update_packages | bool
       register: template_upgrade
       changed_when: "'Nothing to do.' not in (template_upgrade.stdout | default(''))"
+      retries: 3
+      delay: 10
+      until: template_upgrade.rc == 0
 
     - name: Clean dnf cache inside template CT
       ansible.builtin.command:
