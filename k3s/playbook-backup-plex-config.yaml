@@ -1,0 +1,194 @@
+---
+- name: Backup Plex config from one k3s worker LXC
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    # Inventory host key in [k3s_workers], e.g. -e k3s_plex_worker_host=k3sw2
+    k3s_plex_worker_host: ""
+
+    # Scale Plex to 0 during backup for consistent sqlite capture.
+    k3s_plex_backup_quiesce: true
+    k3s_plex_backup_namespace: plex-media-server
+    k3s_plex_backup_deployment: plex
+    k3s_plex_backup_wait_timeout: "180s"
+
+    # Backup destination inside worker LXC.
+    k3s_plex_backup_root: /volumes/plex-config-backups
+
+  pre_tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in [k3s_controller]."
+
+    - name: Ensure a worker host was provided
+      ansible.builtin.assert:
+        that:
+          - k3s_plex_worker_host | trim | length > 0
+        fail_msg: "Set -e k3s_plex_worker_host=<inventory_host>."
+
+    - name: Ensure selected worker host exists in inventory
+      ansible.builtin.assert:
+        that:
+          - k3s_plex_worker_host in hostvars
+          - hostvars[k3s_plex_worker_host].pct_id is defined
+        fail_msg: "Worker host '{{ k3s_plex_worker_host }}' must exist and define pct_id."
+
+    - name: Set controller and worker execution facts
+      ansible.builtin.set_fact:
+        k3s_plex_controller_pct_id: "{{ hostvars[groups['k3s_controller'] | first].pct_id }}"
+        k3s_plex_worker_pct_id: "{{ hostvars[k3s_plex_worker_host].pct_id }}"
+        k3s_plex_backup_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+    - name: Set backup path fact
+      ansible.builtin.set_fact:
+        k3s_plex_backup_path: "{{ k3s_plex_backup_root }}/plex-config-backup-{{ k3s_plex_backup_timestamp }}"
+
+  tasks:
+    - name: Read current Plex deployment replicas
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_plex_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl -n {{ k3s_plex_backup_namespace }}
+            get deploy {{ k3s_plex_backup_deployment }}
+            -o jsonpath='{.spec.replicas}'
+      register: k3s_plex_backup_replicas_raw
+      changed_when: false
+
+    - name: Set original replicas fact
+      ansible.builtin.set_fact:
+        k3s_plex_backup_original_replicas: "{{ k3s_plex_backup_replicas_raw.stdout | default('1') | trim | int }}"
+
+    - name: Backup Plex config with optional quiesce
+      block:
+        - name: Scale Plex deployment down for backup consistency
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_backup_namespace }}
+                scale deploy/{{ k3s_plex_backup_deployment }} --replicas=0
+          when:
+            - k3s_plex_backup_quiesce | bool
+            - k3s_plex_backup_original_replicas > 0
+          changed_when: true
+
+        - name: Wait for Plex rollout after scale down
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_backup_namespace }}
+                rollout status deploy/{{ k3s_plex_backup_deployment }}
+                --timeout={{ k3s_plex_backup_wait_timeout }}
+          when:
+            - k3s_plex_backup_quiesce | bool
+            - k3s_plex_backup_original_replicas > 0
+          changed_when: false
+
+        - name: Create Plex config backup in target worker
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                set -eu;
+                mkdir -p {{ k3s_plex_backup_root | quote }};
+                rm -rf {{ k3s_plex_backup_path | quote }};
+                cp -a /volumes/plex-config {{ k3s_plex_backup_path | quote }}
+          changed_when: true
+
+        - name: Verify Preferences.xml exists in backup
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                test -f {{ (k3s_plex_backup_path ~ '/Library/Application Support/Plex Media Server/Preferences.xml') | quote }}
+          changed_when: false
+
+      always:
+        - name: Restore Plex deployment replicas after backup attempt
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_backup_namespace }}
+                scale deploy/{{ k3s_plex_backup_deployment }}
+                --replicas={{ k3s_plex_backup_original_replicas }}
+          when:
+            - k3s_plex_backup_quiesce | bool
+            - k3s_plex_backup_original_replicas > 0
+          changed_when: true
+          failed_when: false
+
+        - name: Wait for Plex rollout after scale restore attempt
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_backup_namespace }}
+                rollout status deploy/{{ k3s_plex_backup_deployment }}
+                --timeout={{ k3s_plex_backup_wait_timeout }}
+          when:
+            - k3s_plex_backup_quiesce | bool
+            - k3s_plex_backup_original_replicas > 0
+          changed_when: false
+          failed_when: false
+
+    - name: Print Plex backup summary
+      ansible.builtin.debug:
+        msg:
+          - "worker={{ k3s_plex_worker_host }} pct_id={{ k3s_plex_worker_pct_id }}"
+          - "backup_path={{ k3s_plex_backup_path }}"
+          - "original_replicas={{ k3s_plex_backup_original_replicas }}"
+          - "quiesced={{ k3s_plex_backup_quiesce | bool }}"

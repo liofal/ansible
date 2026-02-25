@@ -1,0 +1,334 @@
+---
+- name: Restore Plex config from Proxmox vzdump archive into one k3s worker LXC
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    # Inventory host key in [k3s_workers], e.g. -e k3s_plex_worker_host=k3sw2
+    k3s_plex_worker_host: ""
+
+    # Full path to Proxmox vzdump archive, e.g.
+    # -e k3s_plex_restore_archive=/mnt/pve/diskstation/dump/vzdump-lxc-109-2026_02_22-01_08_02.tar.zst
+    k3s_plex_restore_archive: ""
+
+    # Scale Plex to 0 during restore for consistency.
+    k3s_plex_restore_quiesce: true
+    k3s_plex_restore_namespace: plex-media-server
+    k3s_plex_restore_deployment: plex
+    k3s_plex_restore_wait_timeout: "300s"
+
+    # Safety/validation controls.
+    k3s_plex_restore_require_claimed_state: true
+    k3s_plex_restore_uid: "568"
+    k3s_plex_restore_gid: "568"
+
+    # Paths.
+    k3s_plex_restore_staging_parent: /tmp
+    k3s_plex_restore_backup_root: /volumes/plex-config-backups
+
+  pre_tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in [k3s_controller]."
+
+    - name: Ensure required restore inputs are provided
+      ansible.builtin.assert:
+        that:
+          - k3s_plex_worker_host | trim | length > 0
+          - k3s_plex_restore_archive | trim | length > 0
+        fail_msg: >-
+          Set required vars:
+          -e k3s_plex_worker_host=<inventory_host>
+          -e k3s_plex_restore_archive=<vzdump_tar_zst_path>
+
+    - name: Ensure selected worker host exists in inventory
+      ansible.builtin.assert:
+        that:
+          - k3s_plex_worker_host in hostvars
+          - hostvars[k3s_plex_worker_host].pct_id is defined
+        fail_msg: "Worker host '{{ k3s_plex_worker_host }}' must exist and define pct_id."
+
+    - name: Set controller and worker execution facts
+      ansible.builtin.set_fact:
+        k3s_plex_controller_pct_id: "{{ hostvars[groups['k3s_controller'] | first].pct_id }}"
+        k3s_plex_worker_pct_id: "{{ hostvars[k3s_plex_worker_host].pct_id }}"
+        k3s_plex_restore_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+
+    - name: Set restore staging and backup path facts
+      ansible.builtin.set_fact:
+        k3s_plex_restore_stage_dir: "{{ k3s_plex_restore_staging_parent }}/plex-restore-{{ k3s_plex_restore_timestamp }}"
+        k3s_plex_restore_prebackup_path: "{{ k3s_plex_restore_backup_root }}/pre-restore-{{ k3s_plex_restore_timestamp }}"
+
+  tasks:
+    - name: Ensure restore archive is readable on Proxmox host
+      ansible.builtin.command:
+        argv:
+          - test
+          - -r
+          - "{{ k3s_plex_restore_archive }}"
+      changed_when: false
+
+    - name: Recreate restore staging directory
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -lc
+          - >-
+            rm -rf {{ k3s_plex_restore_stage_dir | quote }} &&
+            mkdir -p {{ k3s_plex_restore_stage_dir | quote }}
+      changed_when: true
+
+    - name: Extract plex-config from vzdump archive into staging
+      ansible.builtin.command:
+        argv:
+          - tar
+          - --zstd
+          - -xf
+          - "{{ k3s_plex_restore_archive }}"
+          - -C
+          - "{{ k3s_plex_restore_stage_dir }}"
+          - ./volumes/plex-config
+      changed_when: true
+
+    - name: Ensure extracted Preferences.xml exists
+      ansible.builtin.command:
+        argv:
+          - test
+          - -f
+          - "{{ k3s_plex_restore_stage_dir }}/volumes/plex-config/Library/Application Support/Plex Media Server/Preferences.xml"
+      changed_when: false
+
+    - name: Ensure extracted state is claimed
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -q
+          - PlexOnlineToken="
+          - "{{ k3s_plex_restore_stage_dir }}/volumes/plex-config/Library/Application Support/Plex Media Server/Preferences.xml"
+      when: k3s_plex_restore_require_claimed_state | bool
+      changed_when: false
+
+    - name: Read current Plex deployment replicas
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_plex_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl -n {{ k3s_plex_restore_namespace }}
+            get deploy {{ k3s_plex_restore_deployment }}
+            -o jsonpath='{.spec.replicas}'
+      register: k3s_plex_restore_replicas_raw
+      changed_when: false
+
+    - name: Set original replicas fact
+      ansible.builtin.set_fact:
+        k3s_plex_restore_original_replicas: "{{ k3s_plex_restore_replicas_raw.stdout | default('1') | trim | int }}"
+
+    - name: Restore Plex config with optional quiesce
+      block:
+        - name: Scale Plex deployment down for restore
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_restore_namespace }}
+                scale deploy/{{ k3s_plex_restore_deployment }} --replicas=0
+          when:
+            - k3s_plex_restore_quiesce | bool
+            - k3s_plex_restore_original_replicas > 0
+          changed_when: true
+
+        - name: Wait for Plex rollout after scale down
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_restore_namespace }}
+                rollout status deploy/{{ k3s_plex_restore_deployment }}
+                --timeout={{ k3s_plex_restore_wait_timeout }}
+          when:
+            - k3s_plex_restore_quiesce | bool
+            - k3s_plex_restore_original_replicas > 0
+          changed_when: false
+
+        - name: Create pre-restore backup in target worker
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                set -eu;
+                mkdir -p {{ k3s_plex_restore_backup_root | quote }};
+                rm -rf {{ k3s_plex_restore_prebackup_path | quote }};
+                cp -a /volumes/plex-config {{ k3s_plex_restore_prebackup_path | quote }}
+          changed_when: true
+
+        - name: Ensure tar exists in target worker LXC
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                command -v tar >/dev/null 2>&1 ||
+                (command -v dnf >/dev/null 2>&1 && dnf install -y tar >/dev/null)
+          changed_when: false
+
+        - name: Verify tar is available in target worker LXC
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - command -v tar >/dev/null 2>&1
+          changed_when: false
+
+        - name: Wipe current Plex config in target worker
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - rm -rf /volumes/plex-config/*
+          changed_when: true
+
+        - name: Stream restored plex-config into target worker
+          ansible.builtin.shell: |
+            set -euo pipefail
+            tar -C {{ k3s_plex_restore_stage_dir | quote }} -cf - ./volumes/plex-config \
+              | sudo -n /usr/sbin/pct exec {{ k3s_plex_worker_pct_id | quote }} -- tar -xf - -C /
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Enforce ownership and permissions for restored config
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                chown -R {{ k3s_plex_restore_uid }}:{{ k3s_plex_restore_gid }} /volumes/plex-config &&
+                chmod -R u+rwX,g+rwX /volumes/plex-config
+          changed_when: true
+
+        - name: Verify restored Preferences includes machine identity and token
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_worker_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                tr ' ' '\n' < "/volumes/plex-config/Library/Application Support/Plex Media Server/Preferences.xml" |
+                grep -E "MachineIdentifier=|ProcessedMachineIdentifier=|PlexOnlineToken=|PlexOnlineMail="
+          register: k3s_plex_restore_identity
+          changed_when: false
+
+      always:
+        - name: Remove local restore staging directory
+          ansible.builtin.command:
+            argv:
+              - rm
+              - -rf
+              - "{{ k3s_plex_restore_stage_dir }}"
+          changed_when: true
+          failed_when: false
+
+        - name: Restore Plex deployment replicas after restore attempt
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_restore_namespace }}
+                scale deploy/{{ k3s_plex_restore_deployment }}
+                --replicas={{ k3s_plex_restore_original_replicas }}
+          when:
+            - k3s_plex_restore_quiesce | bool
+            - k3s_plex_restore_original_replicas > 0
+          changed_when: true
+          failed_when: false
+
+        - name: Wait for Plex rollout after restore scale attempt
+          ansible.builtin.command:
+            argv:
+              - sudo
+              - /usr/sbin/pct
+              - exec
+              - "{{ k3s_plex_controller_pct_id }}"
+              - --
+              - bash
+              - -lc
+              - >-
+                export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+                /usr/local/bin/kubectl -n {{ k3s_plex_restore_namespace }}
+                rollout status deploy/{{ k3s_plex_restore_deployment }}
+                --timeout={{ k3s_plex_restore_wait_timeout }}
+          when:
+            - k3s_plex_restore_quiesce | bool
+            - k3s_plex_restore_original_replicas > 0
+          changed_when: false
+          failed_when: false
+
+    - name: Print Plex restore summary
+      ansible.builtin.debug:
+        msg:
+          - "worker={{ k3s_plex_worker_host }} pct_id={{ k3s_plex_worker_pct_id }}"
+          - "archive={{ k3s_plex_restore_archive }}"
+          - "pre_restore_backup={{ k3s_plex_restore_prebackup_path }}"
+          - "restored_replicas={{ k3s_plex_restore_original_replicas }}"
+          - "identity={{ (k3s_plex_restore_identity.stdout_lines | default([])) | join('; ') }}"
