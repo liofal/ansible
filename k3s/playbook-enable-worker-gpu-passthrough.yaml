@@ -1,0 +1,216 @@
+---
+- name: Enable GPU passthrough for one k3s worker LXC
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    # Inventory host key in [k3s_workers], e.g. -e k3s_gpu_worker_host=k3sw2
+    k3s_gpu_worker_host: ""
+    k3s_gpu_drain_timeout: "300s"
+    k3s_gpu_wait_timeout: "300s"
+
+    # Optional node label management (useful for Plex scheduling by role)
+    k3s_gpu_manage_label: true
+    k3s_gpu_label_key: "workload.liofal.net/plex"
+    k3s_gpu_label_value: "true"
+
+  pre_tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in the [k3s_controller] group."
+
+    - name: Ensure a worker host was provided
+      ansible.builtin.assert:
+        that:
+          - k3s_gpu_worker_host | trim | length > 0
+        fail_msg: "Set -e k3s_gpu_worker_host=<inventory_host>."
+
+    - name: Ensure selected worker host exists in inventory
+      ansible.builtin.assert:
+        that:
+          - k3s_gpu_worker_host in hostvars
+          - hostvars[k3s_gpu_worker_host].pct_id is defined
+          - hostvars[k3s_gpu_worker_host].node_name is defined
+        fail_msg: "Worker host '{{ k3s_gpu_worker_host }}' must exist and define pct_id + node_name."
+
+    - name: Set controller and worker execution facts
+      ansible.builtin.set_fact:
+        k3s_gpu_controller_host: "{{ groups['k3s_controller'] | first }}"
+        k3s_gpu_controller_pct_id: "{{ hostvars[groups['k3s_controller'] | first].pct_id }}"
+        k3s_gpu_worker_pct_id: "{{ hostvars[k3s_gpu_worker_host].pct_id }}"
+        k3s_gpu_worker_node_name: "{{ hostvars[k3s_gpu_worker_host].node_name }}"
+        k3s_gpu_worker_conf_path: "/etc/pve/lxc/{{ hostvars[k3s_gpu_worker_host].pct_id }}.conf"
+
+  tasks:
+    - name: Ensure Proxmox host exposes /dev/dri/card0 as a character device
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - test
+          - -c
+          - /dev/dri/card0
+      changed_when: false
+
+    - name: Cordon worker before LXC restart
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_gpu_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl cordon {{ k3s_gpu_worker_node_name }}
+      register: k3s_gpu_cordon
+      changed_when: "'already cordoned' not in ((k3s_gpu_cordon.stdout | default('')) ~ (k3s_gpu_cordon.stderr | default('')))"
+      failed_when: false
+
+    - name: Drain worker before LXC restart
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_gpu_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl drain {{ k3s_gpu_worker_node_name }}
+            --ignore-daemonsets --delete-emptydir-data --disable-eviction
+            --timeout={{ k3s_gpu_drain_timeout }}
+      register: k3s_gpu_drain
+      changed_when: "'drained' in (k3s_gpu_drain.stdout | default(''))"
+      failed_when: >-
+        (k3s_gpu_drain.rc != 0)
+        and ('already cordoned' not in ((k3s_gpu_drain.stdout | default('')) ~ (k3s_gpu_drain.stderr | default(''))))
+
+    - name: Ensure DRM device cgroup rule exists in LXC config
+      ansible.builtin.shell: |
+        set -eu
+        conf="{{ k3s_gpu_worker_conf_path }}"
+        line='lxc.cgroup2.devices.allow: c 226:* rwm'
+        if sudo -n grep -Fxq "$line" "$conf"; then
+          echo "present"
+        else
+          printf '%s\n' "$line" | sudo -n tee -a "$conf" >/dev/null
+          echo "added"
+        fi
+      register: k3s_gpu_conf_devices
+      changed_when: "'added' in (k3s_gpu_conf_devices.stdout | default(''))"
+
+    - name: Ensure /dev/dri bind mount exists in LXC config
+      ansible.builtin.shell: |
+        set -eu
+        conf="{{ k3s_gpu_worker_conf_path }}"
+        line='lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir'
+        if sudo -n grep -Fxq "$line" "$conf"; then
+          echo "present"
+        else
+          printf '%s\n' "$line" | sudo -n tee -a "$conf" >/dev/null
+          echo "added"
+        fi
+      register: k3s_gpu_conf_mount
+      changed_when: "'added' in (k3s_gpu_conf_mount.stdout | default(''))"
+
+    - name: Stop worker LXC to apply passthrough config
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - stop
+          - "{{ k3s_gpu_worker_pct_id }}"
+      register: k3s_gpu_stop
+      changed_when: k3s_gpu_stop.rc == 0
+      failed_when: false
+
+    - name: Start worker LXC after passthrough config
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - start
+          - "{{ k3s_gpu_worker_pct_id }}"
+      register: k3s_gpu_start
+      changed_when: k3s_gpu_start.rc == 0
+
+    - name: Wait for worker node to become Ready again
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_gpu_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl wait --for=condition=Ready node/{{ k3s_gpu_worker_node_name }}
+            --timeout={{ k3s_gpu_wait_timeout }}
+      changed_when: false
+
+    - name: Uncordon worker after restart
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_gpu_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl uncordon {{ k3s_gpu_worker_node_name }}
+      register: k3s_gpu_uncordon
+      changed_when: "'uncordoned' in ((k3s_gpu_uncordon.stdout | default('')) ~ (k3s_gpu_uncordon.stderr | default('')))"
+      failed_when: false
+
+    - name: Label worker node for GPU workload scheduling
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_gpu_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl label node {{ k3s_gpu_worker_node_name }}
+            {{ k3s_gpu_label_key }}={{ k3s_gpu_label_value }} --overwrite
+      when: k3s_gpu_manage_label | bool
+      register: k3s_gpu_label
+      changed_when: "'labeled' in ((k3s_gpu_label.stdout | default('')) ~ (k3s_gpu_label.stderr | default('')))"
+
+    - name: Verify /dev/dri/card0 is exposed in worker LXC
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_gpu_worker_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - test -c /dev/dri/card0 && ls -l /dev/dri/card0
+      register: k3s_gpu_verify
+      changed_when: false
+
+    - name: Print GPU passthrough summary
+      ansible.builtin.debug:
+        msg:
+          - "worker={{ k3s_gpu_worker_host }} pct_id={{ k3s_gpu_worker_pct_id }} node={{ k3s_gpu_worker_node_name }}"
+          - "lxc_conf={{ k3s_gpu_worker_conf_path }}"
+          - "config_devices={{ k3s_gpu_conf_devices.stdout | default('') | trim }} config_mount={{ k3s_gpu_conf_mount.stdout | default('') | trim }}"
+          - "verify={{ k3s_gpu_verify.stdout | default('') | trim }}"

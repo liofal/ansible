@@ -148,3 +148,22 @@ ansible-playbook k3s/playbook-postcheck-k3s-upgrade.yaml
 ```
 
 After validation, repeat this worker replacement flow one node at a time.
+
+## Major Upgrade Orchestration (Repeatable As-Code)
+
+For a reusable major upgrade flow (Rocky 10 now, Rocky 11 later), use:
+
+- Runbook: `k3s/docs/major-upgrade-runbook.md`
+- Orchestrator: `k3s/playbook-k3s-major-upgrade.yaml`
+- Profile vars: `k3s/vars/major-upgrade/rocky10.yaml`
+
+Example:
+
+```bash
+ansible-playbook k3s/playbook-k3s-major-upgrade.yaml \
+  -e @k3s/vars/major-upgrade/rocky10.yaml \
+  -e k3s_upgrade_canary_old_worker_host=<old_worker> \
+  -e k3s_upgrade_canary_new_worker_host=<new_worker>
+```
+
+This keeps execution order explicit and reusable across future major OS generations.

@@ -1,0 +1,28 @@
+---
+- name: Validate LXC template handoff (Terraform-owned build)
+  hosts: localhost
+  gather_facts: false
+  vars:
+    k3s_upgrade_profile: "{{ k3s_upgrade_profile | default('rocky10', true) }}"
+    k3s_upgrade_template_name: "{{ k3s_upgrade_template_name | default('', true) }}"
+    k3s_upgrade_template_version: "{{ k3s_upgrade_template_version | default('latest', true) }}"
+    k3s_upgrade_template_ref: "{{ k3s_upgrade_template_name }}:{{ k3s_upgrade_template_version }}"
+
+  tasks:
+    - name: Validate template metadata used by downstream replacement
+      ansible.builtin.assert:
+        that:
+          - k3s_upgrade_template_name | trim | length > 0
+          - k3s_upgrade_template_version | trim | length > 0
+        fail_msg: >-
+          Template metadata is required. Provide
+          -e k3s_upgrade_template_name=<name> -e k3s_upgrade_template_version=<version>
+          or -e @k3s/vars/major-upgrade/<profile>.yaml.
+
+    - name: Explain Terraform handoff for template build
+      ansible.builtin.debug:
+        msg:
+          - "Template creation is Terraform-owned; this playbook is a guardrail for repeatable input."
+          - "profile={{ k3s_upgrade_profile }}"
+          - "template_ref={{ k3s_upgrade_template_ref }}"
+          - "Proceed with Terraform node provisioning using this template reference."

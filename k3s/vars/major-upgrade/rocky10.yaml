@@ -1,0 +1,7 @@
+---
+k3s_upgrade_profile: rocky10
+k3s_upgrade_template_name: rocky-10-lxc-template
+k3s_upgrade_template_version: latest
+k3s_upgrade_api_endpoint: https://k3s-api.liofal.net:6443
+k3s_upgrade_drain_timeout: 300s
+k3s_upgrade_wait_timeout: 300s

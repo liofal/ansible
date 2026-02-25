@@ -1,0 +1,48 @@
+---
+- name: Validate major upgrade orchestration inputs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    k3s_upgrade_profile: "{{ k3s_upgrade_profile | default('rocky10', true) }}"
+    k3s_upgrade_canary_old_worker_host: "{{ k3s_upgrade_canary_old_worker_host | default('', true) }}"
+    k3s_upgrade_canary_new_worker_host: "{{ k3s_upgrade_canary_new_worker_host | default('', true) }}"
+    k3s_upgrade_api_endpoint: "{{ k3s_upgrade_api_endpoint | default('', true) }}"
+    k3s_upgrade_wait_timeout: "{{ k3s_upgrade_wait_timeout | default('300s', true) }}"
+
+  tasks:
+    - name: Validate required canary inputs
+      ansible.builtin.assert:
+        that:
+          - k3s_upgrade_profile | trim | length > 0
+          - k3s_upgrade_canary_old_worker_host | trim | length > 0
+          - k3s_upgrade_canary_new_worker_host | trim | length > 0
+          - k3s_upgrade_canary_old_worker_host != k3s_upgrade_canary_new_worker_host
+          - k3s_upgrade_api_endpoint | trim | length > 0
+        fail_msg: >-
+          Missing canary inputs. Provide profile vars and the canary pair:
+          -e k3s_upgrade_canary_old_worker_host=<old_worker>
+          -e k3s_upgrade_canary_new_worker_host=<new_worker>
+
+    - name: Print major-upgrade canary execution plan
+      ansible.builtin.debug:
+        msg:
+          - "profile={{ k3s_upgrade_profile }}"
+          - "canary_old={{ k3s_upgrade_canary_old_worker_host }}"
+          - "canary_new={{ k3s_upgrade_canary_new_worker_host }}"
+          - "api_endpoint={{ k3s_upgrade_api_endpoint }}"
+          - "wait_timeout={{ k3s_upgrade_wait_timeout }}"
+
+- import_playbook: playbook-k3s-upgrade-precheck.yaml
+
+- import_playbook: playbook-lxc-template-build.yaml
+
+- import_playbook: playbook-k3s-node-replace.yaml
+  vars:
+    k3s_replace_old_worker_host: "{{ k3s_upgrade_canary_old_worker_host }}"
+    k3s_replace_new_worker_host: "{{ k3s_upgrade_canary_new_worker_host }}"
+    k3s_replace_server_url: "{{ k3s_upgrade_api_endpoint }}"
+    k3s_replace_wait_timeout: "{{ k3s_upgrade_wait_timeout }}"
+    k3s_replace_stop_old_agent: true
+    k3s_replace_delete_old_node: true
+
+- import_playbook: playbook-k3s-upgrade-postcheck.yaml

@@ -1,0 +1,46 @@
+---
+- name: Validate single node replacement inputs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    k3s_replace_old_worker_host: "{{ k3s_replace_old_worker_host | default('', true) }}"
+    k3s_replace_new_worker_host: "{{ k3s_replace_new_worker_host | default('', true) }}"
+    k3s_replace_server_url: "{{ k3s_replace_server_url | default('', true) }}"
+    k3s_replace_wait_timeout: "{{ k3s_replace_wait_timeout | default('300s', true) }}"
+    k3s_replace_stop_old_agent: "{{ k3s_replace_stop_old_agent | default(true, true) }}"
+    k3s_replace_delete_old_node: "{{ k3s_replace_delete_old_node | default(true, true) }}"
+
+  tasks:
+    - name: Validate replacement pair
+      ansible.builtin.assert:
+        that:
+          - k3s_replace_old_worker_host | trim | length > 0
+          - k3s_replace_new_worker_host | trim | length > 0
+          - k3s_replace_old_worker_host != k3s_replace_new_worker_host
+        fail_msg: >-
+          Provide distinct hosts:
+          -e k3s_replace_old_worker_host=<old_worker>
+          -e k3s_replace_new_worker_host=<new_worker>
+
+    - name: Print replacement plan
+      ansible.builtin.debug:
+        msg:
+          - "old={{ k3s_replace_old_worker_host }}"
+          - "new={{ k3s_replace_new_worker_host }}"
+          - "server_url={{ k3s_replace_server_url | default('auto-controller-url', true) }}"
+          - "wait_timeout={{ k3s_replace_wait_timeout }}"
+          - "stop_old_agent={{ k3s_replace_stop_old_agent | bool }} delete_old_node={{ k3s_replace_delete_old_node | bool }}"
+
+- import_playbook: playbook-join-k3s-worker.yaml
+  vars:
+    k3s_join_worker_host: "{{ k3s_replace_new_worker_host }}"
+    k3s_join_server_url: "{{ k3s_replace_server_url }}"
+    k3s_join_wait_timeout: "{{ k3s_replace_wait_timeout }}"
+
+- import_playbook: playbook-canary-worker-cutover.yaml
+  vars:
+    k3s_canary_old_worker_host: "{{ k3s_replace_old_worker_host }}"
+    k3s_canary_new_worker_host: "{{ k3s_replace_new_worker_host }}"
+    k3s_canary_wait_timeout: "{{ k3s_replace_wait_timeout }}"
+    k3s_canary_stop_old_agent: "{{ k3s_replace_stop_old_agent | bool }}"
+    k3s_canary_delete_old_node: "{{ k3s_replace_delete_old_node | bool }}"

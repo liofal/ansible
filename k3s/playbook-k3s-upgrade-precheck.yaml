@@ -1,0 +1,28 @@
+---
+- import_playbook: playbook-postcheck-k3s-upgrade.yaml
+
+- name: Precheck major-upgrade inputs
+  hosts: localhost
+  gather_facts: false
+  vars:
+    k3s_upgrade_profile: "{{ k3s_upgrade_profile | default('rocky10', true) }}"
+    k3s_upgrade_template_name: "{{ k3s_upgrade_template_name | default('', true) }}"
+    k3s_upgrade_api_endpoint: "{{ k3s_upgrade_api_endpoint | default('', true) }}"
+
+  tasks:
+    - name: Validate required profile inputs
+      ansible.builtin.assert:
+        that:
+          - k3s_upgrade_profile | trim | length > 0
+          - k3s_upgrade_template_name | trim | length > 0
+          - k3s_upgrade_api_endpoint | trim | length > 0
+        fail_msg: >-
+          Missing required vars. Provide profile vars (for example:
+          -e @k3s/vars/major-upgrade/rocky10.yaml).
+
+    - name: Display validated precheck profile
+      ansible.builtin.debug:
+        msg:
+          - "profile={{ k3s_upgrade_profile }}"
+          - "template={{ k3s_upgrade_template_name }}"
+          - "api_endpoint={{ k3s_upgrade_api_endpoint }}"
