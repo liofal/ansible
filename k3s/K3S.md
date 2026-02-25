@@ -55,6 +55,16 @@ Notes:
 - The playbook reads `/etc/rancher/k3s/k3s.yaml` from the controller LXC via `pct exec` on the Proxmox host, rewrites the `server:` field to use the controller `node_name`, and writes the result to your first `KUBECONFIG` path (or `~/.kube/k3s-<controller>.config` if `KUBECONFIG` is unset).
 - If the controller's kubeconfig client certificate is already expired, the playbook will stop `k3s`, run `k3s certificate rotate`, and start `k3s` again before re-fetching the kubeconfig. Disable this behavior with `-e k3s_kubeconfig_rotate_if_expired=false`.
 
+### Traefik Helm installer ownership conflict
+
+If `helm-install-traefik-crd` or `helm-install-traefik` crashloops with `invalid ownership metadata`, reconcile CRD/IngressClass Helm metadata with:
+
+```bash
+ansible-playbook k3s/playbook-reconcile-traefik-crd-ownership.yaml
+```
+
+If you also have a legacy Traefik release in namespace `traefik`, avoid running two Traefik load balancers at once. Keep one as source of truth (recommended: k3s-managed `kube-system/traefik`), then scale/convert the legacy one.
+
 ## Contact
 
 For issues not covered in this documentation, please contact [Contact Information].

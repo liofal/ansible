@@ -1,0 +1,200 @@
+---
+- name: Reconcile Traefik CRD Helm ownership metadata
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    k3s_primary_controller_host: "{{ groups['k3s_controller'] | first }}"
+    k3s_primary_controller_pct_id: "{{ hostvars[k3s_primary_controller_host].pct_id }}"
+
+  tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in [k3s_controller]."
+
+    - name: List Traefik-related CRDs present in cluster
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get crd -o custom-columns=NAME:.metadata.name,GROUP:.spec.group --no-headers |
+            awk '$2=="gateway.networking.k8s.io" || $2=="traefik.io" || $2=="hub.traefik.io" {print $1}'
+      register: k3s_traefik_crds_raw
+      changed_when: false
+
+    - name: Build list of Traefik-related CRDs
+      ansible.builtin.set_fact:
+        k3s_traefik_crds: "{{ k3s_traefik_crds_raw.stdout_lines | map('trim') | reject('equalto', '') | list }}"
+
+    - name: Assert Traefik-related CRDs were discovered
+      ansible.builtin.assert:
+        that:
+          - (k3s_traefik_crds | length) > 0
+        fail_msg: "No Traefik-related CRDs found; nothing to reconcile."
+
+    - name: Read ownership metadata for each Traefik-related CRD
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get crd {{ item }} -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}|{.metadata.annotations.meta\.helm\.sh/release-name}|{.metadata.annotations.meta\.helm\.sh/release-namespace}'
+      loop: "{{ k3s_traefik_crds }}"
+      register: k3s_traefik_crd_metadata
+      changed_when: false
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Patch Traefik-related CRDs with Helm ownership for traefik-crd
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl patch crd {{ item.item }} --type merge -p '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"traefik-crd","meta.helm.sh/release-namespace":"kube-system"}}}'
+      loop: "{{ k3s_traefik_crd_metadata.results }}"
+      when: (item.stdout | trim) != 'Helm|traefik-crd|kube-system'
+      register: k3s_traefik_crd_patch
+      changed_when: true
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Read traefik ingressclass ownership metadata
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get ingressclass traefik -o jsonpath='{.metadata.labels.app\.kubernetes\.io/managed-by}|{.metadata.annotations.meta\.helm\.sh/release-name}|{.metadata.annotations.meta\.helm\.sh/release-namespace}'
+      register: k3s_traefik_ingressclass_metadata
+      changed_when: false
+      failed_when: false
+
+    - name: Patch traefik ingressclass ownership to kube-system release
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl patch ingressclass traefik --type merge -p '{"metadata":{"labels":{"app.kubernetes.io/managed-by":"Helm"},"annotations":{"meta.helm.sh/release-name":"traefik","meta.helm.sh/release-namespace":"kube-system"}}}'
+      when:
+        - k3s_traefik_ingressclass_metadata.rc == 0
+        - (k3s_traefik_ingressclass_metadata.stdout | trim) != 'Helm|traefik|kube-system'
+      changed_when: true
+
+    - name: Show Traefik ownership reconciliation summary
+      ansible.builtin.debug:
+        msg: >-
+          Patched {{
+            (k3s_traefik_crd_patch.results | default([]) | selectattr('changed', 'equalto', true) | list | length)
+          }} CRD(s); ingressclass patched={{ 'yes' if ((k3s_traefik_ingressclass_metadata.stdout | default('') | trim) != 'Helm|traefik|kube-system') else 'no' }}.
+
+    - name: Delete failed traefik-crd installer pods to trigger retry
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl delete pod -n kube-system -l job-name=helm-install-traefik-crd --ignore-not-found=true
+      register: k3s_delete_traefik_crd_pods
+      changed_when: "'deleted' in (k3s_delete_traefik_crd_pods.stdout | default(''))"
+
+    - name: Delete failed traefik installer pods to trigger retry
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl delete pod -n kube-system -l job-name=helm-install-traefik --ignore-not-found=true
+      register: k3s_delete_traefik_pods
+      changed_when: "'deleted' in (k3s_delete_traefik_pods.stdout | default(''))"
+
+    - name: Wait until traefik-crd helm job succeeds
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get job -n kube-system helm-install-traefik-crd -o jsonpath='{.status.succeeded}'
+      register: k3s_traefik_crd_job_succeeded
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: (k3s_traefik_crd_job_succeeded.stdout | trim) == '1'
+
+    - name: Wait until traefik helm job succeeds
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get job -n kube-system helm-install-traefik -o jsonpath='{.status.succeeded}'
+      register: k3s_traefik_job_succeeded
+      changed_when: false
+      retries: 60
+      delay: 5
+      until: (k3s_traefik_job_succeeded.stdout | trim) == '1'
+
+    - name: Show resulting traefik installer pod states
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get pods -n kube-system | grep helm-install-traefik
+      register: k3s_traefik_installers_after
+      changed_when: false
+
+    - name: Display traefik installer pod states
+      ansible.builtin.debug:
+        msg: "{{ k3s_traefik_installers_after.stdout }}"
