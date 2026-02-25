@@ -109,7 +109,13 @@ Recommended sequence:
 
 1. Provision one extra worker LXC from the new template via Terraform.
 2. Add the new worker to your Ansible inventory (`[k3s_workers]` with `pct_id` + `node_name`).
-3. Join only that worker to the cluster:
+3. Ensure worker prerequisites are present (installs `nfs-utils`, configures `/dev/kmsg` helper):
+
+```bash
+ansible-playbook k3s/playbook-ensure-worker-prereqs.yaml
+```
+
+4. Join only that worker to the cluster:
 
 ```bash
 ansible-playbook k3s/playbook-join-k3s-worker.yaml \
@@ -117,7 +123,7 @@ ansible-playbook k3s/playbook-join-k3s-worker.yaml \
   -e k3s_join_server_url=https://k3s-api.<domain>:6443
 ```
 
-4. Shift workload from old worker to new worker:
+5. Shift workload from old worker to new worker:
 
 ```bash
 ansible-playbook k3s/playbook-canary-worker-cutover.yaml \
@@ -125,7 +131,7 @@ ansible-playbook k3s/playbook-canary-worker-cutover.yaml \
   -e k3s_canary_new_worker_host=<new_worker_inventory_name>
 ```
 
-5. Optional hard cutover cleanup:
+6. Optional hard cutover cleanup:
 
 ```bash
 ansible-playbook k3s/playbook-canary-worker-cutover.yaml \
@@ -135,7 +141,7 @@ ansible-playbook k3s/playbook-canary-worker-cutover.yaml \
   -e k3s_canary_delete_old_node=true
 ```
 
-6. Run cluster health checks:
+7. Run cluster health checks:
 
 ```bash
 ansible-playbook k3s/playbook-postcheck-k3s-upgrade.yaml

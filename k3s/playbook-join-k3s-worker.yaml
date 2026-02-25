@@ -91,7 +91,7 @@
       changed_when: false
       failed_when: false
     - name: Ensure /dev/kmsg compatibility service exists in target worker
-      ansible.builtin.include_tasks: _ensure_worker_kmsg_tasks.yaml
+      ansible.builtin.include_tasks: _ensure_worker_prereqs_tasks.yaml
       vars:
         k3s_target_worker_pct_id: "{{ k3s_worker_pct_id }}"
 
@@ -112,7 +112,6 @@
       register: k3s_worker_node_present
       changed_when: false
       failed_when: false
-
     # noqa pipefail
     - name: Install or update k3s agent on target worker
       ansible.builtin.shell: |
@@ -125,7 +124,9 @@
             K3S_TOKEN={{ k3s_token }} \
             sh -s - --node-name {{ k3s_worker_node_name }}'
       register: k3s_join_result
-      changed_when: k3s_join_result.stdout | regex_search('Downloading binary|Starting k3s-agent')
+      changed_when: >-
+        (k3s_join_result.stdout | default('', true)) is search('Downloading binary|Starting k3s-agent')
+      failed_when: false
       when: >-
         (k3s_worker_version.stdout | default('', true) | trim) != (k3s_controller_version.stdout | trim)
         or (k3s_worker_node_present.rc != 0)

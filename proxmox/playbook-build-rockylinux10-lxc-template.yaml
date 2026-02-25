@@ -246,6 +246,23 @@
       retries: 3
       delay: 10
       until: template_upgrade.rc == 0
+    - name: Install nfs-utils inside template CT
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_template_vmid }}"
+          - --
+          - bash
+          - -lc
+          - dnf -y install nfs-utils
+      when:
+        - not (k3s_template_skip_build | default(false))
+        - k3s_template_update_packages | bool
+      register: template_nfs_utils
+      changed_when: "'Nothing to do.' not in (template_nfs_utils.stdout | default(''))"
 
     - name: Clean dnf cache inside template CT
       ansible.builtin.command:

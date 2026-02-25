@@ -1,0 +1,22 @@
+---
+- name: Ensure k3s worker prerequisites in all worker LXCs
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+
+  pre_tasks:
+    - name: Ensure inventory defines at least one k3s worker
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_workers'] is defined
+          - (groups['k3s_workers'] | length) > 0
+        fail_msg: "Inventory must define at least one host in the [k3s_workers] group."
+
+  tasks:
+    - name: Ensure worker prerequisites for each k3s worker
+      ansible.builtin.include_tasks: _ensure_worker_prereqs_tasks.yaml
+      vars:
+        k3s_target_worker_pct_id: "{{ hostvars[item].pct_id }}"
+      loop: "{{ groups['k3s_workers'] }}"
+      loop_control:
+        label: "{{ item }} (pct_id={{ hostvars[item].pct_id }})"
