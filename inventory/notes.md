@@ -32,3 +32,18 @@ k3sc3 pct_id=107 node_name=k3sc3.liofal.net
 k3sw1 pct_id=102 node_name=k3sw1.liofal.net
 k3sw2 pct_id=109 node_name=k3sw2.liofal.net
 ```
+
+## Temporary canary worker pattern
+
+For major template/OS upgrades, add one temporary worker entry in `[k3s_workers]`.
+
+Example:
+
+```ini
+[k3s_workers]
+k3sw6 pct_id=110 node_name=k3sw6.liofal.net
+```
+
+Use this canary with:
+- `k3s/playbook-join-k3s-worker.yaml`
+- `k3s/playbook-canary-worker-cutover.yaml`

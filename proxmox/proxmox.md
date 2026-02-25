@@ -16,6 +16,7 @@ This document outlines the management practices for the Proxmox Virtual Environm
 Ansible playbooks are used to automate key management tasks on the Proxmox host:
 
 - **Package Upgrades:** `proxmox/playbook-upgrade-proxmox.yaml` handles system package updates.
+- **Rocky 10 LXC Template Build:** `proxmox/playbook-build-rockylinux10-lxc-template.yaml` builds a reusable Rocky 10 container template for k3s canary/major upgrade workflows.
 - **Major Upgrades (8 to 9):**
     - `proxmox/playbook-precheck-proxmox-8to9.yaml`
     - `proxmox/playbook-prepare-proxmox-8to9.yaml`
@@ -52,3 +53,40 @@ Common issues related to managing the Proxmox host via Ansible and their resolut
 ## Contact
 
 For issues not covered in this documentation, please contact [Contact Information].
+
+## Rocky 10 LXC Template Build (for k3s major upgrades)
+
+Use `proxmox/playbook-build-rockylinux10-lxc-template.yaml` to build (or rebuild) a reusable Rocky Linux 10 LXC template directly on Proxmox.
+
+Example:
+
+```bash
+ansible-playbook proxmox/playbook-build-rockylinux10-lxc-template.yaml \
+  -e k3s_template_vmid=120 \
+  -e k3s_template_storage=local \
+  -e k3s_template_rootfs_storage=local-lvm
+```
+
+If VMID already exists and you intentionally want to replace it:
+
+```bash
+ansible-playbook proxmox/playbook-build-rockylinux10-lxc-template.yaml \
+  -e k3s_template_vmid=120 \
+  -e k3s_template_rebuild=true
+```
+
+### Sudoers requirements for ansible user
+
+If you run playbooks as a non-root SSH user with `sudo -n`, allow:
+
+- `/usr/bin/pveam update`
+- `/usr/bin/pveam available *`
+- `/usr/bin/pveam download *`
+- `/usr/sbin/pct config *`
+- `/usr/sbin/pct create *`
+- `/usr/sbin/pct start *`
+- `/usr/sbin/pct stop *`
+- `/usr/sbin/pct exec *`
+- `/usr/sbin/pct template *`
+- `/usr/sbin/pct destroy *`
+- `/usr/bin/test -f /var/lib/vz/template/cache/*`

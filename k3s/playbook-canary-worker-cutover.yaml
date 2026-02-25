@@ -1,0 +1,197 @@
+---
+- name: Cut over workload from old worker to canary worker
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    # Required inventory host keys, e.g. -e k3s_canary_old_worker_host=k3sw1 -e k3s_canary_new_worker_host=k3sw6
+    k3s_canary_old_worker_host: ""
+    k3s_canary_new_worker_host: ""
+    # Optional safety flags
+    k3s_canary_delete_old_node: false
+    k3s_canary_stop_old_agent: false
+    k3s_canary_wait_timeout: "300s"
+
+  pre_tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in the [k3s_controller] group."
+
+    - name: Ensure old and new worker hosts are provided
+      ansible.builtin.assert:
+        that:
+          - k3s_canary_old_worker_host | trim | length > 0
+          - k3s_canary_new_worker_host | trim | length > 0
+          - k3s_canary_old_worker_host != k3s_canary_new_worker_host
+        fail_msg: >-
+          Provide distinct hosts with
+          -e k3s_canary_old_worker_host=<old_worker>
+          -e k3s_canary_new_worker_host=<new_worker>.
+
+    - name: Ensure old worker host exists in inventory
+      ansible.builtin.assert:
+        that:
+          - k3s_canary_old_worker_host in hostvars
+          - hostvars[k3s_canary_old_worker_host].pct_id is defined
+          - hostvars[k3s_canary_old_worker_host].node_name is defined
+        fail_msg: "Old worker host must exist and define pct_id + node_name."
+
+    - name: Ensure new worker host exists in inventory
+      ansible.builtin.assert:
+        that:
+          - k3s_canary_new_worker_host in hostvars
+          - hostvars[k3s_canary_new_worker_host].pct_id is defined
+          - hostvars[k3s_canary_new_worker_host].node_name is defined
+        fail_msg: "New worker host must exist and define pct_id + node_name."
+
+    - name: Set execution context facts
+      ansible.builtin.set_fact:
+        k3s_controller_host: "{{ groups['k3s_controller'] | first }}"
+        k3s_controller_pct_id: "{{ hostvars[groups['k3s_controller'] | first].pct_id }}"
+        k3s_canary_old_node_name: "{{ hostvars[k3s_canary_old_worker_host].node_name }}"
+        k3s_canary_new_node_name: "{{ hostvars[k3s_canary_new_worker_host].node_name }}"
+        k3s_canary_old_pct_id: "{{ hostvars[k3s_canary_old_worker_host].pct_id }}"
+
+  tasks:
+    - name: Wait for canary worker node to be Ready before cutover
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl wait --for=condition=Ready node/{{ k3s_canary_new_node_name }} --timeout={{ k3s_canary_wait_timeout }}
+      changed_when: false
+
+    - name: Cordon old worker node
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl cordon {{ k3s_canary_old_node_name }}
+      register: k3s_cordon_result
+      changed_when: >-
+        'already cordoned' not in (k3s_cordon_result.stdout | default('') | lower)
+      failed_when: >-
+        k3s_cordon_result.rc != 0 and
+        ('already cordoned' not in (k3s_cordon_result.stdout | default('') | lower)) and
+        ('already cordoned' not in (k3s_cordon_result.stderr | default('') | lower))
+
+    - name: Drain old worker node
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl drain {{ k3s_canary_old_node_name }} --ignore-daemonsets --delete-emptydir-data --disable-eviction --timeout={{ k3s_canary_wait_timeout }}
+      register: k3s_drain_result
+      changed_when: >-
+        ('already cordoned' not in (k3s_drain_result.stdout | default('') | lower)) and
+        ('already drained' not in (k3s_drain_result.stdout | default('') | lower))
+      failed_when: >-
+        k3s_drain_result.rc != 0 and
+        ('already cordoned' not in (k3s_drain_result.stdout | default('') | lower)) and
+        ('already cordoned' not in (k3s_drain_result.stderr | default('') | lower)) and
+        ('already drained' not in (k3s_drain_result.stdout | default('') | lower)) and
+        ('already drained' not in (k3s_drain_result.stderr | default('') | lower))
+
+    - name: Optionally stop old k3s agent service in LXC
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_canary_old_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - systemctl disable --now k3s-agent
+      when: k3s_canary_stop_old_agent | bool
+      register: k3s_old_agent_stop
+      changed_when: k3s_old_agent_stop.rc == 0
+      failed_when: false
+
+    - name: Optionally delete old node object from cluster
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl delete node {{ k3s_canary_old_node_name }}
+      when: k3s_canary_delete_old_node | bool
+      register: k3s_delete_node_result
+      changed_when: "'deleted' in (k3s_delete_node_result.stdout | default('') | lower)"
+      failed_when: >-
+        k3s_delete_node_result.rc != 0 and
+        ('not found' not in (k3s_delete_node_result.stdout | default('') | lower)) and
+        ('not found' not in (k3s_delete_node_result.stderr | default('') | lower))
+
+    - name: Ensure canary worker is schedulable
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl uncordon {{ k3s_canary_new_node_name }}
+      register: k3s_uncordon_result
+      changed_when: >-
+        'already uncordoned' not in (k3s_uncordon_result.stdout | default('') | lower)
+      failed_when: >-
+        k3s_uncordon_result.rc != 0 and
+        ('already uncordoned' not in (k3s_uncordon_result.stdout | default('') | lower)) and
+        ('already uncordoned' not in (k3s_uncordon_result.stderr | default('') | lower))
+
+    - name: Show node summary after cutover
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get nodes -o wide
+      register: k3s_nodes_summary
+      changed_when: false
+
+    - name: Print cutover summary
+      ansible.builtin.debug:
+        msg:
+          - "Old worker host: {{ k3s_canary_old_worker_host }} ({{ k3s_canary_old_node_name }})"
+          - "New worker host: {{ k3s_canary_new_worker_host }} ({{ k3s_canary_new_node_name }})"
+          - "delete_old_node={{ k3s_canary_delete_old_node | bool }}, stop_old_agent={{ k3s_canary_stop_old_agent | bool }}"
+          - "{{ k3s_nodes_summary.stdout }}"

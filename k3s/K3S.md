@@ -100,3 +100,45 @@ ansible-playbook k3s/playbook-validate-k3s-ha.yaml -e k3s_ha_take_snapshot=true
 Notes:
 - If no API load balancer/VIP exists yet, use the primary controller URL for initial join.
 - DNS round-robin works as temporary lab mode but is not health-aware failover.
+
+## Major LXC/OS Upgrade Canary Workflow (Workers)
+
+When introducing a new major Rocky/template generation, use worker canary replacement instead of in-place full-cluster upgrades.
+
+Recommended sequence:
+
+1. Provision one extra worker LXC from the new template via Terraform.
+2. Add the new worker to your Ansible inventory (`[k3s_workers]` with `pct_id` + `node_name`).
+3. Join only that worker to the cluster:
+
+```bash
+ansible-playbook k3s/playbook-join-k3s-worker.yaml \
+  -e k3s_join_worker_host=<new_worker_inventory_name> \
+  -e k3s_join_server_url=https://k3s-api.<domain>:6443
+```
+
+4. Shift workload from old worker to new worker:
+
+```bash
+ansible-playbook k3s/playbook-canary-worker-cutover.yaml \
+  -e k3s_canary_old_worker_host=<old_worker_inventory_name> \
+  -e k3s_canary_new_worker_host=<new_worker_inventory_name>
+```
+
+5. Optional hard cutover cleanup:
+
+```bash
+ansible-playbook k3s/playbook-canary-worker-cutover.yaml \
+  -e k3s_canary_old_worker_host=<old_worker_inventory_name> \
+  -e k3s_canary_new_worker_host=<new_worker_inventory_name> \
+  -e k3s_canary_stop_old_agent=true \
+  -e k3s_canary_delete_old_node=true
+```
+
+6. Run cluster health checks:
+
+```bash
+ansible-playbook k3s/playbook-postcheck-k3s-upgrade.yaml
+```
+
+After validation, repeat this worker replacement flow one node at a time.

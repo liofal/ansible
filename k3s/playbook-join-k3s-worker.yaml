@@ -1,0 +1,132 @@
+---
+- name: Join a single worker node to an existing k3s cluster
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    # Required inventory host key in [k3s_workers], e.g. -e k3s_join_worker_host=k3sw6
+    k3s_join_worker_host: ""
+    # Optional override, e.g. https://k3s-api.liofal.net:6443
+    k3s_join_server_url: ""
+    # kubelet/node registration wait timeout
+    k3s_join_wait_timeout: "300s"
+
+  pre_tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in the [k3s_controller] group."
+
+    - name: Ensure a worker host was provided
+      ansible.builtin.assert:
+        that:
+          - k3s_join_worker_host | trim | length > 0
+        fail_msg: "Set -e k3s_join_worker_host=<inventory_host>."
+
+    - name: Ensure selected worker host exists in inventory
+      ansible.builtin.assert:
+        that:
+          - k3s_join_worker_host in hostvars
+          - hostvars[k3s_join_worker_host].pct_id is defined
+          - hostvars[k3s_join_worker_host].node_name is defined
+        fail_msg: "Worker host '{{ k3s_join_worker_host }}' must exist and define pct_id + node_name."
+
+    - name: Set controller and worker execution context facts
+      ansible.builtin.set_fact:
+        k3s_controller_host: "{{ groups['k3s_controller'] | first }}"
+        k3s_controller_pct_id: "{{ hostvars[groups['k3s_controller'] | first].pct_id }}"
+        k3s_worker_pct_id: "{{ hostvars[k3s_join_worker_host].pct_id }}"
+        k3s_worker_node_name: "{{ hostvars[k3s_join_worker_host].node_name }}"
+
+    - name: Determine server URL when not explicitly set
+      ansible.builtin.set_fact:
+        k3s_join_server_url_effective: >-
+          {{
+            (k3s_join_server_url | trim)
+            if (k3s_join_server_url | trim | length > 0)
+            else 'https://' ~ hostvars[k3s_controller_host].node_name ~ ':6443'
+          }}
+
+    - name: Determine K3s shared token
+      ansible.builtin.set_fact:
+        k3s_token: "{{ lookup('env', 'K3S_TOKEN') | default(env_token_from_file, true) }}"
+      vars:
+        env_contents: "{{ lookup('file', '../.env', errors='ignore') | default('') }}"
+        env_token_from_file: "{{ env_contents | regex_search('(?:export\\s+)?K3S_TOKEN=([^\\n]+)', '\\1') | default('', true) }}"
+
+    - name: Fail if K3s shared token is unavailable
+      ansible.builtin.fail:
+        msg: "K3S_TOKEN is missing. Export it in your environment or add it to .env."
+      when: k3s_token | length == 0
+
+  tasks:
+    - name: Read current k3s version on primary controller
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - /usr/local/bin/k3s --version | head -n1 | cut -d' ' -f3
+      register: k3s_controller_version
+      changed_when: false
+
+    - name: Read current k3s version on target worker
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_worker_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - /usr/local/bin/k3s --version | head -n1 | cut -d' ' -f3
+      register: k3s_worker_version
+      changed_when: false
+      failed_when: false
+
+    # noqa pipefail
+    - name: Install or update k3s agent on target worker
+      ansible.builtin.shell: |
+        sudo /usr/sbin/pct exec {{ k3s_worker_pct_id }} -- bash -lc '
+          set -o pipefail &&
+          curl -fsL https://get.k3s.io | \
+            INSTALL_K3S_SKIP_SELINUX_RPM=true \
+            INSTALL_K3S_VERSION={{ k3s_controller_version.stdout | trim }} \
+            K3S_URL={{ k3s_join_server_url_effective }} \
+            K3S_TOKEN={{ k3s_token }} \
+            sh -s - --node-name {{ k3s_worker_node_name }}'
+      register: k3s_join_result
+      changed_when: k3s_join_result.stdout | regex_search('Downloading binary|Starting k3s-agent')
+      when: (k3s_worker_version.stdout | default('', true) | trim) != (k3s_controller_version.stdout | trim)
+      no_log: true
+
+    - name: Wait for target worker node to become Ready
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl wait --for=condition=Ready node/{{ k3s_worker_node_name }} --timeout={{ k3s_join_wait_timeout }}
+      changed_when: false
+
+    - name: Show worker join summary
+      ansible.builtin.debug:
+        msg:
+          - "Worker host: {{ k3s_join_worker_host }}"
+          - "Worker node: {{ k3s_worker_node_name }}"
+          - "Server URL: {{ k3s_join_server_url_effective }}"
+          - "Controller version: {{ k3s_controller_version.stdout | trim }}"
+          - "Worker version before run: {{ k3s_worker_version.stdout | default('not-installed', true) | trim }}"

@@ -1,0 +1,304 @@
+---
+- name: Build Rocky Linux 10 LXC template on Proxmox
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    # Template target
+    k3s_template_vmid: 120
+    k3s_template_hostname: rocky10-k3s-template
+
+    # Proxmox storage/layout
+    k3s_template_storage: local
+    k3s_template_cache_dir: /var/lib/vz/template/cache
+    k3s_template_rootfs_storage: local-lvm
+    k3s_template_rootfs_size_gb: 8
+    k3s_template_bridge: vmbr0
+
+    # LXC sizing and profile for k3s compatibility
+    k3s_template_cores: 2
+    k3s_template_memory_mb: 2048
+    k3s_template_swap_mb: 512
+    k3s_template_unprivileged: false
+
+    # Lifecycle controls
+    k3s_template_rebuild: false
+    k3s_template_update_packages: true
+    k3s_template_archive_override: ""
+
+  tasks:
+    - name: Refresh Proxmox appliance index
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/bin/pveam
+          - update
+      changed_when: false
+
+    - name: Discover latest Rocky Linux 10 appliance archive
+      ansible.builtin.shell: |
+        set -o pipefail
+        sudo -n /usr/bin/pveam available {{ k3s_template_storage }} \
+          | awk '{print $2}' \
+          | grep -E '^rockylinux-10-default_[0-9]{8}_[a-z0-9]+\.tar\.(xz|zst)$' \
+          | sort -V \
+          | tail -n1
+      register: rocky10_archive_auto
+      changed_when: false
+
+    - name: Determine selected Rocky 10 appliance archive
+      ansible.builtin.set_fact:
+        k3s_template_archive: >-
+          {{
+            (k3s_template_archive_override | trim)
+            if (k3s_template_archive_override | trim | length > 0)
+            else (rocky10_archive_auto.stdout | trim)
+          }}
+
+    - name: Fail when no Rocky Linux 10 appliance archive is available
+      ansible.builtin.assert:
+        that:
+          - k3s_template_archive | length > 0
+        fail_msg: >-
+          No Rocky Linux 10 appliance archive found via pveam.
+          Check `pveam available {{ k3s_template_storage }}` or provide
+          `-e k3s_template_archive_override=<archive_name>`.
+
+    - name: Check whether selected appliance archive is already cached
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - test
+          - -f
+          - "{{ k3s_template_cache_dir }}/{{ k3s_template_archive }}"
+      register: rocky10_archive_cached
+      changed_when: false
+      failed_when: false
+
+    - name: Download Rocky Linux 10 appliance archive when missing
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/bin/pveam
+          - download
+          - "{{ k3s_template_storage }}"
+          - "{{ k3s_template_archive }}"
+      when: rocky10_archive_cached.rc != 0
+      register: rocky10_archive_download
+      changed_when: rocky10_archive_download.rc == 0
+
+    - name: Check whether target VMID already exists
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - config
+          - "{{ k3s_template_vmid }}"
+      register: existing_ct_config
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether existing VMID is already a template
+      ansible.builtin.shell: |
+        sudo -n /usr/sbin/pct config {{ k3s_template_vmid }} \
+          | awk -F': ' '/^template:/{print $2}'
+      when: existing_ct_config.rc == 0
+      register: existing_ct_template_flag
+      changed_when: false
+      failed_when: false
+
+    - name: Skip build when VMID is already a template and rebuild is disabled
+      ansible.builtin.set_fact:
+        k3s_template_skip_build: true
+      when:
+        - existing_ct_config.rc == 0
+        - (existing_ct_template_flag.stdout | default('', true) | trim) == '1'
+        - not (k3s_template_rebuild | bool)
+
+    - name: Fail when VMID exists and is not a template (rebuild disabled)
+      ansible.builtin.fail:
+        msg: >-
+          VMID {{ k3s_template_vmid }} already exists and is not a template.
+          Use another VMID or run with -e k3s_template_rebuild=true.
+      when:
+        - existing_ct_config.rc == 0
+        - (existing_ct_template_flag.stdout | default('', true) | trim) != '1'
+        - not (k3s_template_rebuild | bool)
+
+    - name: Stop existing CT before rebuild
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - stop
+          - "{{ k3s_template_vmid }}"
+      when:
+        - existing_ct_config.rc == 0
+        - k3s_template_rebuild | bool
+      register: existing_ct_stop
+      changed_when: existing_ct_stop.rc == 0
+      failed_when: false
+
+    - name: Destroy existing CT/template before rebuild
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - destroy
+          - "{{ k3s_template_vmid }}"
+          - --purge
+          - "1"
+      when:
+        - existing_ct_config.rc == 0
+        - k3s_template_rebuild | bool
+      register: existing_ct_destroy
+      changed_when: existing_ct_destroy.rc == 0
+
+    - name: Create new Rocky Linux 10 CT from appliance archive
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - create
+          - "{{ k3s_template_vmid }}"
+          - "{{ k3s_template_storage }}:vztmpl/{{ k3s_template_archive }}"
+          - --hostname
+          - "{{ k3s_template_hostname }}"
+          - --cores
+          - "{{ k3s_template_cores }}"
+          - --memory
+          - "{{ k3s_template_memory_mb }}"
+          - --swap
+          - "{{ k3s_template_swap_mb }}"
+          - --rootfs
+          - "{{ k3s_template_rootfs_storage }}:{{ k3s_template_rootfs_size_gb }}"
+          - --net0
+          - "name=eth0,bridge={{ k3s_template_bridge }},ip=dhcp,ip6=auto"
+          - --features
+          - "nesting=1,keyctl=1"
+          - --unprivileged
+          - "{{ 1 if (k3s_template_unprivileged | bool) else 0 }}"
+          - --onboot
+          - "0"
+      when: not (k3s_template_skip_build | default(false))
+      register: create_template_ct
+      changed_when: create_template_ct.rc == 0
+
+    - name: Start CT for base package refresh
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - start
+          - "{{ k3s_template_vmid }}"
+      when:
+        - not (k3s_template_skip_build | default(false))
+        - k3s_template_update_packages | bool
+      register: start_template_ct
+      changed_when: start_template_ct.rc == 0
+
+    - name: Refresh dnf metadata inside template CT
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_template_vmid }}"
+          - --
+          - bash
+          - -lc
+          - dnf -q makecache --refresh
+      when:
+        - not (k3s_template_skip_build | default(false))
+        - k3s_template_update_packages | bool
+      changed_when: false
+
+    - name: Upgrade packages inside template CT
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_template_vmid }}"
+          - --
+          - bash
+          - -lc
+          - dnf -y upgrade
+      when:
+        - not (k3s_template_skip_build | default(false))
+        - k3s_template_update_packages | bool
+      register: template_upgrade
+      changed_when: "'Nothing to do.' not in (template_upgrade.stdout | default(''))"
+
+    - name: Clean dnf cache inside template CT
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_template_vmid }}"
+          - --
+          - bash
+          - -lc
+          - dnf clean all
+      when:
+        - not (k3s_template_skip_build | default(false))
+        - k3s_template_update_packages | bool
+      changed_when: false
+
+    - name: Stop CT before converting to template
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - stop
+          - "{{ k3s_template_vmid }}"
+      when: not (k3s_template_skip_build | default(false))
+      register: stop_template_ct
+      changed_when: stop_template_ct.rc == 0
+      failed_when: false
+
+    - name: Convert CT to Proxmox template
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - -n
+          - /usr/sbin/pct
+          - template
+          - "{{ k3s_template_vmid }}"
+      when: not (k3s_template_skip_build | default(false))
+      register: convert_to_template
+      changed_when: convert_to_template.rc == 0
+
+    - name: Verify template flag is set
+      ansible.builtin.shell: |
+        sudo -n /usr/sbin/pct config {{ k3s_template_vmid }} \
+          | awk -F': ' '/^template:/{print $2}'
+      register: verify_template_flag
+      changed_when: false
+
+    - name: Assert VMID is now a template
+      ansible.builtin.assert:
+        that:
+          - (verify_template_flag.stdout | trim) == '1'
+        fail_msg: "VMID {{ k3s_template_vmid }} exists but is not marked as template."
+
+    - name: Report template build result
+      ansible.builtin.debug:
+        msg:
+          - "template_vmid={{ k3s_template_vmid }}"
+          - "template_archive={{ k3s_template_archive }}"
+          - "template_storage={{ k3s_template_storage }}"
+          - "skip_build={{ k3s_template_skip_build | default(false) }}"
