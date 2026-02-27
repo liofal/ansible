@@ -174,6 +174,24 @@
       loop_control:
         label: "{{ hostvars[item].node_name | default(item, true) }}"
 
+    - name: Check k3s service args include --disable traefik on additional controllers
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ hostvars[item].pct_id }}"
+          - --
+          - bash
+          - -lc
+          - systemctl cat k3s | grep -F -- --disable
+      loop: "{{ k3s_join_controller_hosts }}"
+      register: k3s_join_disable_traefik_checks
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
     - name: Read node status/roles for additional controllers
       ansible.builtin.command:
         argv:
@@ -195,6 +213,7 @@
     - name: Build join status list for additional controllers
       vars:
         k3s_service_probe: "{{ (k3s_join_service_states.results | selectattr('item', 'equalto', item.item) | first | default({})) }}"
+        k3s_disable_traefik_probe: "{{ (k3s_join_disable_traefik_checks.results | selectattr('item', 'equalto', item.item) | first | default({})) }}"
         k3s_node_probe: "{{ (k3s_join_node_states.results | selectattr('item', 'equalto', item.item) | first | default({})) }}"
         k3s_node_state: "{{ ((k3s_node_probe.stdout | default('')) | trim) }}"
       ansible.builtin.set_fact:
@@ -206,6 +225,7 @@
               'node_name': (hostvars[item.item].node_name | default(item.item, true)),
               'current_version': (item.stdout | trim),
               'service_active': ((k3s_service_probe.stdout | default('')) | trim),
+              'disable_traefik': ((k3s_disable_traefik_probe.rc | default(1)) == 0),
               'registered': ((k3s_node_probe.rc | default(1)) == 0),
               'node_state': k3s_node_state,
               'ready': ((k3s_node_probe.rc | default(1)) == 0) and (k3s_node_state is match('^Ready\\|')),
@@ -213,6 +233,7 @@
               'needs_join': (
                 ((item.stdout | trim) != k3s_target_version_effective)
                 or (((k3s_service_probe.stdout | default('')) | trim) != 'active')
+                or ((k3s_disable_traefik_probe.rc | default(1)) != 0)
                 or ((k3s_node_probe.rc | default(1)) != 0)
                 or not (k3s_node_state is match('^Ready\\|'))
                 or not ('etcd' in k3s_node_state)
@@ -228,6 +249,7 @@
         msg: >-
           Node={{ item.node_name }} current={{ item.current_version | default('not installed', true) }}
           service={{ item.service_active | default('unknown', true) }}
+          disable_traefik={{ 'yes' if item.disable_traefik else 'no' }}
           registered={{ 'yes' if item.registered else 'no' }}
           ready={{ 'yes' if item.ready else 'no' }}
           roles={{ item.node_state | default('n/a', true) }}
@@ -349,7 +371,7 @@
       ansible.builtin.shell: |
         sudo /usr/sbin/pct exec {{ hostvars[item.host].pct_id }} -- bash -lc "set -o pipefail && curl -fsL https://get.k3s.io | \
         INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_VERSION={{ k3s_target_version_effective }} K3S_TOKEN='{{ k3s_server_token_raw.stdout | trim }}' \
-        sh -s - server --server {{ k3s_server_url }} --node-name {{ item.node_name }} --node-taint {{ k3s_controller_node_taint }}"
+        sh -s - server --server {{ k3s_server_url }} --disable traefik --node-name {{ item.node_name }} --node-taint {{ k3s_controller_node_taint }}"
       loop: "{{ k3s_join_status | default([]) }}"
       when: item.needs_join
       register: k3s_join_result
