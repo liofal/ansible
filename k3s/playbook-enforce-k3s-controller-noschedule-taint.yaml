@@ -1,0 +1,103 @@
+---
+- name: Enforce NoSchedule taint on k3s controller nodes
+  hosts: proxmox_server
+  gather_facts: false
+  become: false
+  vars:
+    k3s_primary_controller_host: "{{ groups['k3s_controller'] | first }}"
+    k3s_primary_controller_pct_id: "{{ hostvars[k3s_primary_controller_host].pct_id }}"
+    # Override if needed, e.g. -e k3s_controller_node_taint='node-role.kubernetes.io/control-plane=true:NoSchedule'
+    k3s_controller_node_taint: "node-role.kubernetes.io/control-plane=true:NoSchedule"
+
+  tasks:
+    - name: Ensure inventory defines at least one k3s controller
+      ansible.builtin.assert:
+        that:
+          - groups['k3s_controller'] is defined
+          - (groups['k3s_controller'] | length) > 0
+        fail_msg: "Inventory must define at least one host in the [k3s_controller] group."
+
+    - name: Ensure each controller has node_name and pct_id in inventory
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].node_name is defined
+          - hostvars[item].pct_id is defined
+        fail_msg: "Controller '{{ item }}' must define node_name and pct_id."
+      loop: "{{ groups['k3s_controller'] }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Read current taints on each controller node
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get node {{ hostvars[item].node_name }} -o jsonpath='{range .spec.taints[*]}{.key}={.value}:{.effect}{"\n"}{end}'
+      loop: "{{ groups['k3s_controller'] }}"
+      register: k3s_controller_taints_before
+      changed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name }}"
+
+    - name: Apply NoSchedule taint to controller nodes when missing
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl taint nodes {{ hostvars[item.item].node_name }} {{ k3s_controller_node_taint }} --overwrite
+      loop: "{{ k3s_controller_taints_before.results }}"
+      when: k3s_controller_node_taint not in (item.stdout_lines | default([]))
+      register: k3s_controller_taint_apply
+      changed_when: true
+      loop_control:
+        label: "{{ hostvars[item.item].node_name }}"
+
+    - name: Read taints on each controller node after enforcement
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get node {{ hostvars[item].node_name }} -o jsonpath='{range .spec.taints[*]}{.key}={.value}:{.effect}{"\n"}{end}'
+      loop: "{{ groups['k3s_controller'] }}"
+      register: k3s_controller_taints_after
+      changed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name }}"
+
+    - name: Assert each controller has the expected NoSchedule taint
+      ansible.builtin.assert:
+        that:
+          - k3s_controller_node_taint in (item.stdout_lines | default([]))
+        fail_msg: >-
+          Controller {{ item.item }} ({{ hostvars[item.item].node_name }}) is missing taint {{ k3s_controller_node_taint }}.
+      loop: "{{ k3s_controller_taints_after.results }}"
+      loop_control:
+        label: "{{ hostvars[item.item].node_name }}"
+
+    - name: Show taint reconciliation summary
+      ansible.builtin.debug:
+        msg:
+          - "Controller taint enforced: {{ k3s_controller_node_taint }}"
+          - "Nodes checked: {{ groups['k3s_controller'] | length }}"
+          - "Nodes changed: {{ (k3s_controller_taint_apply.results | default([]) | selectattr('changed', 'equalto', true) | list | length) }}"

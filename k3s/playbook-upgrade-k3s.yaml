@@ -7,6 +7,10 @@
     # Optional: set with -e k3s_target_version=vX.Y.Z+k3sN to pin a specific version.
     k3s_target_version: ""
     k3s_release_channel: "stable"
+
+    # Keep controllers unschedulable for regular workloads.
+    # Override if needed, e.g. -e k3s_controller_node_taint="node-role.kubernetes.io/control-plane=true:NoSchedule"
+    k3s_controller_node_taint: "node-role.kubernetes.io/control-plane=true:NoSchedule"
   pre_tasks:
     - name: Determine K3s shared token
       ansible.builtin.set_fact:
@@ -121,7 +125,7 @@
     - name: Upgrade k3s controller node {{ hostvars[item.host].node_name }}
       ansible.builtin.shell: |
         sudo /usr/sbin/pct exec {{ hostvars[item.host].pct_id }} -- bash -c "set -o pipefail && curl -fsL https://get.k3s.io | \
-        INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_VERSION={{ k3s_target_version }} sh -s - --disable traefik --node-name {{ hostvars[item.host].node_name }}"
+        INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_VERSION={{ k3s_target_version }} sh -s - --disable traefik --node-name {{ hostvars[item.host].node_name }} --node-taint {{ k3s_controller_node_taint }}"
       loop: "{{ k3s_controller_versions | default([]) }}"
       when: item.current != k3s_target_version
       register: upgrade_controller_result

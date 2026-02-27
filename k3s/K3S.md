@@ -97,7 +97,16 @@ ansible-playbook k3s/playbook-validate-k3s-ha.yaml
 ansible-playbook k3s/playbook-validate-k3s-ha.yaml -e k3s_ha_take_snapshot=true
 ```
 
+4. Enforce controller scheduling policy (NoSchedule taint):
+
+```bash
+ansible-playbook k3s/playbook-enforce-k3s-controller-noschedule-taint.yaml
+```
+
 Notes:
+- Controller taints prevent new regular workloads from landing on control-plane nodes.
+- Existing pods already running on controllers will not be evicted automatically; restart/rollout those workloads to reschedule onto workers.
+
 - If no API load balancer/VIP exists yet, use the primary controller URL for initial join.
 - DNS round-robin works as temporary lab mode but is not health-aware failover.
 

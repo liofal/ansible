@@ -14,6 +14,9 @@
     # Optional pin, e.g. -e k3s_target_version=v1.34.4+k3s1
     k3s_target_version: ""
 
+    # Override if needed, e.g. -e k3s_controller_node_taint="node-role.kubernetes.io/control-plane=true:NoSchedule"
+    k3s_controller_node_taint: "node-role.kubernetes.io/control-plane=true:NoSchedule"
+
   tasks:
     - name: Ensure inventory defines at least two k3s controllers
       ansible.builtin.assert:
@@ -196,7 +199,7 @@
       ansible.builtin.shell: |
         sudo /usr/sbin/pct exec {{ hostvars[item.host].pct_id }} -- bash -lc "set -o pipefail && curl -fsL https://get.k3s.io | \
         INSTALL_K3S_SKIP_SELINUX_RPM=true INSTALL_K3S_VERSION={{ k3s_target_version_effective }} K3S_TOKEN='{{ k3s_server_token_raw.stdout | trim }}' \
-        sh -s - server --server {{ k3s_server_url }} --node-name {{ item.node_name }}"
+        sh -s - server --server {{ k3s_server_url }} --node-name {{ item.node_name }} --node-taint {{ k3s_controller_node_taint }}"
       loop: "{{ k3s_join_status | default([]) }}"
       when: item.needs_join
       register: k3s_join_result
