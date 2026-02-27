@@ -3,6 +3,15 @@
   hosts: proxmox_server
   gather_facts: false
   become: false
+  vars:
+    # Ignore known noisy one-shot k3s bootstrap jobs that can stay in CrashLoopBackOff
+    # after initial cluster bootstrap when using external Traefik management.
+    k3s_health_ignore_pod_patterns:
+      - '^kube-system/helm-install-traefik-'
+      - '^kube-system/helm-install-traefik-crd-'
+
+    # Keep strict by default. Set false to report unhealthy pods without failing the run.
+    k3s_health_fail_on_unhealthy_pods: true
 
   tasks:
     - name: Ensure inventory defines at least one k3s controller
@@ -17,6 +26,24 @@
         k3s_controller_host: "{{ groups['k3s_controller'] | first }}"
         k3s_controller_pct_id: "{{ hostvars[groups['k3s_controller'] | first].pct_id }}"
       run_once: true
+
+    - name: Ensure controller PCT is running before health checks
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - status
+          - "{{ k3s_controller_pct_id }}"
+      register: k3s_controller_pct_status
+      changed_when: false
+
+    - name: Fail when controller PCT is not running
+      ansible.builtin.assert:
+        that:
+          - (k3s_controller_pct_status.stdout | default('')) is search('status:\\s*running')
+        fail_msg: >-
+          Controller PCT {{ k3s_controller_pct_id }} is not running:
+          {{ k3s_controller_pct_status.stdout | default('unknown') }}
 
     - name: Read node table from k3s controller
       ansible.builtin.command:
@@ -42,13 +69,13 @@
           - --
           - bash
           - -lc
-          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get nodes --no-headers | awk '{print $1"\t"$2}'
+          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get nodes --no-headers | awk '{print $1"|"$2}'
       register: k3s_nodes_status
       changed_when: false
 
     - name: Build list of non-Ready nodes
       ansible.builtin.set_fact:
-        k3s_non_ready_nodes: "{{ k3s_nodes_status.stdout_lines | reject('equalto', '') | reject('search', '\tReady$') | list }}"
+        k3s_non_ready_nodes: "{{ k3s_nodes_status.stdout_lines | reject('equalto', '') | reject('search', '\\|Ready$') | list }}"
 
     - name: Fail when one or more nodes are not Ready
       ansible.builtin.assert:
@@ -57,7 +84,7 @@
         fail_msg: "Detected non-Ready nodes: {{ k3s_non_ready_nodes | join(', ') }}"
         success_msg: "All k3s nodes are Ready."
 
-    - name: Read k3s pod status table
+    - name: Read unhealthy deployments (READY x/y where x < y)
       ansible.builtin.command:
         argv:
           - sudo
@@ -67,25 +94,157 @@
           - --
           - bash
           - -lc
-          - export KUBECONFIG=/etc/rancher/k3s/k3s.yaml && /usr/local/bin/kubectl get pods -A --no-headers | awk '{print $1"/"$2"\t"$4}'
-      register: k3s_pods_status
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get deploy -A --no-headers |
+            awk '{split($3,a,"/"); if ((a[2]+0) > 0 && (a[1]+0) < (a[2]+0)) print $1"/"$2"|"$3}'
+      register: k3s_unhealthy_deployments_raw
       changed_when: false
 
-    - name: Build list of unhealthy pods
-      ansible.builtin.set_fact:
-        k3s_unhealthy_pods: "{{ k3s_pods_status.stdout_lines | reject('equalto', '') | reject('search', '\t(Running|Completed|Succeeded)$') | list }}"
+    - name: Read unhealthy statefulsets (READY x/y where x < y)
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get statefulset -A --no-headers |
+            awk '{split($3,a,"/"); if ((a[2]+0) > 0 && (a[1]+0) < (a[2]+0)) print $1"/"$2"|"$3}'
+      register: k3s_unhealthy_statefulsets_raw
+      changed_when: false
 
-    - name: Fail when unhealthy pods are present
+    - name: Read unhealthy daemonsets (AVAILABLE < DESIRED)
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get daemonset -A --no-headers |
+            awk '{if (($7+0) < ($3+0)) print $1"/"$2"|available="$7"|desired="$3}'
+      register: k3s_unhealthy_daemonsets_raw
+      changed_when: false
+
+    - name: Build unhealthy workload lists
+      ansible.builtin.set_fact:
+        k3s_unhealthy_deployments: "{{ k3s_unhealthy_deployments_raw.stdout_lines | reject('equalto', '') | list }}"
+        k3s_unhealthy_statefulsets: "{{ k3s_unhealthy_statefulsets_raw.stdout_lines | reject('equalto', '') | list }}"
+        k3s_unhealthy_daemonsets: "{{ k3s_unhealthy_daemonsets_raw.stdout_lines | reject('equalto', '') | list }}"
+
+    - name: Fail when unhealthy deployments are present
+      ansible.builtin.assert:
+        that:
+          - k3s_unhealthy_deployments | length == 0
+        fail_msg: "Detected unhealthy Deployments: {{ k3s_unhealthy_deployments | join(', ') }}"
+        success_msg: "All Deployments are healthy."
+
+    - name: Fail when unhealthy statefulsets are present
+      ansible.builtin.assert:
+        that:
+          - k3s_unhealthy_statefulsets | length == 0
+        fail_msg: "Detected unhealthy StatefulSets: {{ k3s_unhealthy_statefulsets | join(', ') }}"
+        success_msg: "All StatefulSets are healthy."
+
+    - name: Fail when unhealthy daemonsets are present
+      ansible.builtin.assert:
+        that:
+          - k3s_unhealthy_daemonsets | length == 0
+        fail_msg: "Detected unhealthy DaemonSets: {{ k3s_unhealthy_daemonsets | join(', ') }}"
+        success_msg: "All DaemonSets are healthy."
+
+    - name: Read raw unhealthy pod status table
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get pods -A --no-headers |
+            awk '{if ($4 !~ /^(Running|Completed|Succeeded)$/) print $1"/"$2"|"$4}'
+      register: k3s_unhealthy_pods_raw
+      changed_when: false
+
+    - name: Initialize filtered unhealthy pod list
+      ansible.builtin.set_fact:
+        k3s_unhealthy_pods: "{{ k3s_unhealthy_pods_raw.stdout_lines | reject('equalto', '') | list }}"
+
+    - name: Apply unhealthy pod ignore patterns
+      ansible.builtin.set_fact:
+        k3s_unhealthy_pods: "{{ k3s_unhealthy_pods | reject('search', item) | list }}"
+      loop: "{{ k3s_health_ignore_pod_patterns }}"
+
+    - name: Read HelmRelease Ready condition statuses when CRD exists
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get helmrelease -A --no-headers 2>/dev/null |
+            awk '{print $1"/"$2"|"$4}'
+      register: k3s_helmrelease_ready
+      changed_when: false
+      failed_when: false
+
+    - name: Build unready HelmRelease list
+      ansible.builtin.set_fact:
+        k3s_unready_helmreleases: >-
+          {{
+            (k3s_helmrelease_ready.stdout_lines | reject('equalto', '') | reject('search', '\\|True$') | list)
+            if (k3s_helmrelease_ready.rc | default(1)) == 0
+            else []
+          }}
+
+    - name: Fail when unready HelmReleases are present
+      ansible.builtin.assert:
+        that:
+          - k3s_unready_helmreleases | length == 0
+        fail_msg: "Detected non-Ready HelmReleases: {{ k3s_unready_helmreleases | join(', ') }}"
+        success_msg: "All HelmReleases are Ready."
+
+    - name: Fail when unhealthy pods are present (strict mode)
       ansible.builtin.assert:
         that:
           - k3s_unhealthy_pods | length == 0
-        fail_msg: "Detected non-healthy pods: {{ k3s_unhealthy_pods | join(', ') }}"
-        success_msg: "All pods are in Running/Completed state."
+        fail_msg: "Detected unhealthy pods: {{ k3s_unhealthy_pods | join(', ') }}"
+        success_msg: "All pods are in Running/Completed/Succeeded state."
+      when: k3s_health_fail_on_unhealthy_pods | bool
 
-    - name: Report post-upgrade cluster summary
+    - name: Warn when unhealthy pods are present (non-strict mode)
+      ansible.builtin.debug:
+        msg: "Detected unhealthy pods (non-strict mode): {{ k3s_unhealthy_pods | join(', ') }}"
+      when:
+        - not (k3s_health_fail_on_unhealthy_pods | bool)
+        - (k3s_unhealthy_pods | length) > 0
+
+    - name: Report cluster health summary
       ansible.builtin.debug:
         msg:
           - "Controller: {{ hostvars[k3s_controller_host].node_name | default(k3s_controller_host, true) }}"
           - "Node inventory:"
           - "{{ k3s_nodes_wide.stdout }}"
-          - "Unhealthy pod count: {{ k3s_unhealthy_pods | length }}"
+          - "unhealthy_deployments={{ k3s_unhealthy_deployments | length }}"
+          - "unhealthy_statefulsets={{ k3s_unhealthy_statefulsets | length }}"
+          - "unhealthy_daemonsets={{ k3s_unhealthy_daemonsets | length }}"
+          - "unhealthy_pods={{ k3s_unhealthy_pods | length }}"
+          - "unready_helmreleases={{ k3s_unready_helmreleases | length }}"

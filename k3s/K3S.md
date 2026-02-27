@@ -103,6 +103,12 @@ ansible-playbook k3s/playbook-validate-k3s-ha.yaml -e k3s_ha_take_snapshot=true
 ansible-playbook k3s/playbook-enforce-k3s-controller-noschedule-taint.yaml
 ```
 
+5. Run routine cluster health gate (anytime):
+
+```bash
+ansible-playbook k3s/playbook-check-k3s-cluster-health.yaml
+```
+
 Notes:
 - Controller taints prevent new regular workloads from landing on control-plane nodes.
 - Existing pods already running on controllers will not be evicted automatically; restart/rollout those workloads to reschedule onto workers.
