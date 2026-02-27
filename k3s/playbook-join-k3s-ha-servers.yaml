@@ -49,8 +49,51 @@
 
     - name: Build list of additional controllers to join
       ansible.builtin.set_fact:
-        k3s_join_controller_hosts: "{{ groups['k3s_controller'][1:] }}"
+        k3s_join_controller_hosts: >-
+          {{ groups['k3s_controller'] | reject('equalto', k3s_primary_controller_host) | list }}
 
+    - name: Check PCT status for primary and additional controllers
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - status
+          - "{{ hostvars[item].pct_id }}"
+      loop: "{{ ([k3s_primary_controller_host] + k3s_join_controller_hosts) | unique }}"
+      register: k3s_join_pct_status
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Start stopped controller PCTs before HA join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - start
+          - "{{ hostvars[item.item].pct_id }}"
+      loop: "{{ k3s_join_pct_status.results }}"
+      when: (item.stdout | default('')) is search('status:\s*stopped')
+      changed_when: true
+      loop_control:
+        label: "{{ hostvars[item.item].node_name | default(item.item, true) }}"
+
+    - name: Wait for controller PCTs to be running before HA join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - status
+          - "{{ hostvars[item.item].pct_id }}"
+      loop: "{{ k3s_join_pct_status.results }}"
+      register: k3s_join_pct_wait
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: (k3s_join_pct_wait.stdout | default('')) is search('status:\s*running')
+      loop_control:
+        label: "{{ hostvars[item.item].node_name | default(item.item, true) }}"
     - name: Read shared K3s server token from primary controller
       ansible.builtin.command:
         argv:
@@ -194,6 +237,113 @@
       loop_control:
         label: "{{ item.node_name }}"
 
+    - name: Ensure etcdctl is available on primary controller for stale-member cleanup
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            if [ ! -x /tmp/etcdctl-3.5.15/etcdctl ]; then
+              cd /tmp &&
+              curl -fsSL -o etcd-v3.5.15-linux-amd64.tar.gz https://github.com/etcd-io/etcd/releases/download/v3.5.15/etcd-v3.5.15-linux-amd64.tar.gz &&
+              /var/lib/rancher/k3s/data/current/bin/busybox tar -xzf etcd-v3.5.15-linux-amd64.tar.gz &&
+              mv -f etcd-v3.5.15-linux-amd64 /tmp/etcdctl-3.5.15;
+            fi
+      changed_when: false
+
+    - name: Find stale etcd member IDs for controllers that need rejoin
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            ETCDCTL_API=3 /tmp/etcdctl-3.5.15/etcdctl
+            --endpoints=https://127.0.0.1:2379
+            --cacert=/var/lib/rancher/k3s/server/tls/etcd/server-ca.crt
+            --cert=/var/lib/rancher/k3s/server/tls/etcd/server-client.crt
+            --key=/var/lib/rancher/k3s/server/tls/etcd/server-client.key
+            member list | awk -F',' '{name=$3; gsub(/^ +| +$/, "", name); if (name ~ /^{{ item.node_name }}-/) print $1}'
+      loop: "{{ k3s_join_status | default([]) }}"
+      when:
+        - item.needs_join
+        - (item.service_active | default('')) != 'active'
+      register: k3s_stale_member_ids
+      changed_when: false
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    - name: Remove stale etcd members for controllers that need rejoin
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_primary_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            ETCDCTL_API=3 /tmp/etcdctl-3.5.15/etcdctl
+            --endpoints=https://127.0.0.1:2379
+            --cacert=/var/lib/rancher/k3s/server/tls/etcd/server-ca.crt
+            --cert=/var/lib/rancher/k3s/server/tls/etcd/server-client.crt
+            --key=/var/lib/rancher/k3s/server/tls/etcd/server-client.key
+            member remove {{ item.stdout | trim }}
+      loop: "{{ k3s_stale_member_ids.results | default([]) }}"
+      when:
+        - item.stdout is defined
+        - (item.stdout | trim | length) > 0
+      changed_when: true
+      loop_control:
+        label: "{{ item.item.node_name | default('unknown') }}"
+    - name: Ensure conf-kmsg helper script exists on controllers that need join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ hostvars[item.host].pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            printf '%s\n' '#!/bin/sh' 'if [ ! -e /dev/kmsg ]; then' '  ln -s /dev/console /dev/kmsg' 'fi' > /usr/local/bin/conf-kmsg.sh &&
+            chmod +x /usr/local/bin/conf-kmsg.sh
+      loop: "{{ k3s_join_status | default([]) }}"
+      when: item.needs_join
+      changed_when: false
+      loop_control:
+        label: "{{ item.node_name }}"
+
+    - name: Ensure conf-kmsg service is enabled on controllers that need join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ hostvars[item.host].pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            printf '%s\n' '[Unit]' 'Description=Make sure /dev/kmsg exists' '' '[Service]' 'Type=oneshot' 'RemainAfterExit=yes' 'ExecStart=/usr/local/bin/conf-kmsg.sh' '' '[Install]' 'WantedBy=multi-user.target' > /etc/systemd/system/conf-kmsg.service &&
+            systemctl daemon-reload &&
+            systemctl enable --now conf-kmsg.service
+      loop: "{{ k3s_join_status | default([]) }}"
+      when: item.needs_join
+      changed_when: false
+      loop_control:
+        label: "{{ item.node_name }}"
     # noqa command-instead-of-module
     - name: Join/reconfigure additional controller nodes to HA cluster
       ansible.builtin.shell: |

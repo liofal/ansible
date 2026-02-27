@@ -106,6 +106,9 @@ ansible-playbook k3s/playbook-enforce-k3s-controller-noschedule-taint.yaml
 Notes:
 - Controller taints prevent new regular workloads from landing on control-plane nodes.
 - Existing pods already running on controllers will not be evicted automatically; restart/rollout those workloads to reschedule onto workers.
+- If replacing the inventory-first controller (for example `k3sc1`), run join with `-e k3s_primary_controller_host=<surviving_controller>`.
+- `playbook-join-k3s-ha-servers.yaml` now auto-prepares `/dev/kmsg` (conf-kmsg service) and removes stale etcd members for nodes that require rejoin.
+- Join and upgrade playbooks include `pct status` preflight checks; join playbooks auto-start stopped target containers before `pct exec`.
 
 - If no API load balancer/VIP exists yet, use the primary controller URL for initial join.
 - DNS round-robin works as temporary lab mode but is not health-aware failover.

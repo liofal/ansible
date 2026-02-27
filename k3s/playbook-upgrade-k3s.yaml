@@ -23,6 +23,40 @@
       ansible.builtin.fail:
         msg: "K3S_TOKEN is missing. Export it in your environment or add it to .env."
       when: k3s_token | length == 0
+    - name: Build list of upgrade target hosts
+      ansible.builtin.set_fact:
+        k3s_upgrade_target_hosts: "{{ ((groups['k3s_controller'] | default([])) + (groups['k3s_workers'] | default([]))) | unique }}"
+
+    - name: Ensure upgrade target host list is not empty
+      ansible.builtin.assert:
+        that:
+          - (k3s_upgrade_target_hosts | length) > 0
+        fail_msg: "No k3s_controller/k3s_workers hosts were found in inventory."
+
+    - name: Check PCT status for upgrade target hosts
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - status
+          - "{{ hostvars[item].pct_id }}"
+      loop: "{{ k3s_upgrade_target_hosts }}"
+      register: k3s_upgrade_pct_status
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Fail when an upgrade target PCT is not running
+      ansible.builtin.fail:
+        msg: >-
+          PCT {{ hostvars[item.item].pct_id }} ({{ hostvars[item.item].node_name | default(item.item, true) }})
+          is '{{ item.stdout | default('unknown', true) | trim }}'.
+          Start the container before running k3s upgrade.
+      loop: "{{ k3s_upgrade_pct_status.results }}"
+      when: (item.stdout | default('')) is not search('status:\s*running')
+      loop_control:
+        label: "{{ hostvars[item.item].node_name | default(item.item, true) }}"
   tasks:
     - name: Normalize optional target version override
       ansible.builtin.set_fact:

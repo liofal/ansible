@@ -40,6 +40,50 @@
         k3s_worker_pct_id: "{{ hostvars[k3s_join_worker_host].pct_id }}"
         k3s_worker_node_name: "{{ hostvars[k3s_join_worker_host].node_name }}"
 
+    - name: Check PCT status for worker join controller and worker
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - status
+          - "{{ hostvars[item].pct_id }}"
+      loop:
+        - "{{ k3s_controller_host }}"
+        - "{{ k3s_join_worker_host }}"
+      register: k3s_join_worker_pct_status
+      changed_when: false
+      failed_when: false
+      loop_control:
+        label: "{{ hostvars[item].node_name | default(item, true) }}"
+
+    - name: Start stopped PCTs before worker join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - start
+          - "{{ hostvars[item.item].pct_id }}"
+      loop: "{{ k3s_join_worker_pct_status.results }}"
+      when: (item.stdout | default('')) is search('status:\s*stopped')
+      changed_when: true
+      loop_control:
+        label: "{{ hostvars[item.item].node_name | default(item.item, true) }}"
+
+    - name: Wait for PCTs to be running before worker join
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - status
+          - "{{ hostvars[item.item].pct_id }}"
+      loop: "{{ k3s_join_worker_pct_status.results }}"
+      register: k3s_join_worker_pct_wait
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: (k3s_join_worker_pct_wait.stdout | default('')) is search('status:\s*running')
+      loop_control:
+        label: "{{ hostvars[item.item].node_name | default(item.item, true) }}"
     - name: Determine server URL when not explicitly set
       ansible.builtin.set_fact:
         k3s_join_server_url_effective: >-
