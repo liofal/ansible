@@ -10,8 +10,17 @@
       - '^kube-system/helm-install-traefik-'
       - '^kube-system/helm-install-traefik-crd-'
 
-    # Keep strict by default. Set false to report unhealthy pods without failing the run.
+    # Optional ignore patterns for workload Warning events.
+    k3s_health_ignore_warning_event_patterns: []
+
+    # Keep strict by default for pod states. Set false to report unhealthy pods without failing the run.
     k3s_health_fail_on_unhealthy_pods: true
+
+    # Warning events are monitored and reported by default, but do not fail the run unless enabled.
+    k3s_health_fail_on_warning_events: false
+
+    # Only keep the most recent N workload warning events in checks/reports.
+    k3s_health_warning_event_limit: 50
 
   tasks:
     - name: Ensure inventory defines at least one k3s controller
@@ -188,6 +197,49 @@
         k3s_unhealthy_pods: "{{ k3s_unhealthy_pods | reject('search', item) | list }}"
       loop: "{{ k3s_health_ignore_pod_patterns }}"
 
+    - name: Read workload warning events (recent list)
+      ansible.builtin.command:
+        argv:
+          - sudo
+          - /usr/sbin/pct
+          - exec
+          - "{{ k3s_controller_pct_id }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export KUBECONFIG=/etc/rancher/k3s/k3s.yaml &&
+            /usr/local/bin/kubectl get events -A --field-selector type=Warning
+            -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.involvedObject.kind}{"|"}{.involvedObject.name}{"|"}{.reason}{"|"}{.message}{"\n"}{end}' |
+            awk -F'|' '$2 ~ /^(Pod|Deployment|ReplicaSet|StatefulSet|DaemonSet)$/ {print}' |
+            tail -n {{ k3s_health_warning_event_limit | int }}
+      register: k3s_warning_events_raw
+      changed_when: false
+
+    - name: Initialize workload warning event list
+      ansible.builtin.set_fact:
+        k3s_warning_events: "{{ k3s_warning_events_raw.stdout_lines | reject('equalto', '') | list }}"
+
+    - name: Apply warning event ignore patterns
+      ansible.builtin.set_fact:
+        k3s_warning_events: "{{ k3s_warning_events | reject('search', item) | list }}"
+      loop: "{{ k3s_health_ignore_warning_event_patterns }}"
+
+    - name: Fail when warning events are present (strict mode)
+      ansible.builtin.assert:
+        that:
+          - k3s_warning_events | length == 0
+        fail_msg: "Detected workload warning events: {{ k3s_warning_events | join(', ') }}"
+        success_msg: "No workload warning events detected in current event list."
+      when: k3s_health_fail_on_warning_events | bool
+
+    - name: Warn when warning events are present (non-strict mode)
+      ansible.builtin.debug:
+        msg: "Detected workload warning events (non-strict mode): {{ k3s_warning_events | join(', ') }}"
+      when:
+        - not (k3s_health_fail_on_warning_events | bool)
+        - (k3s_warning_events | length) > 0
+
     - name: Read HelmRelease Ready condition statuses when CRD exists
       ansible.builtin.command:
         argv:
@@ -247,4 +299,5 @@
           - "unhealthy_statefulsets={{ k3s_unhealthy_statefulsets | length }}"
           - "unhealthy_daemonsets={{ k3s_unhealthy_daemonsets | length }}"
           - "unhealthy_pods={{ k3s_unhealthy_pods | length }}"
+          - "warning_events={{ k3s_warning_events | length }}"
           - "unready_helmreleases={{ k3s_unready_helmreleases | length }}"

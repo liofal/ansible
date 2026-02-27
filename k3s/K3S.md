@@ -107,6 +107,8 @@ ansible-playbook k3s/playbook-enforce-k3s-controller-noschedule-taint.yaml
 
 ```bash
 ansible-playbook k3s/playbook-check-k3s-cluster-health.yaml
+# strict event gate (optional)
+ansible-playbook k3s/playbook-check-k3s-cluster-health.yaml -e k3s_health_fail_on_warning_events=true
 ```
 
 Notes:
